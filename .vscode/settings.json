@@ -1,0 +1,12 @@
+{
+    "files.associations": {
+        "txn.h": "c",
+        "array": "c",
+        "string": "c",
+        "string_view": "c",
+        "ranges": "c",
+        "span": "c",
+        "*.inc": "c",
+        "management.h": "c"
+    }
+}

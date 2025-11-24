@@ -8,6 +8,24 @@
 
 #include "wt_internal.h"
 
+/* 退避サーバへの一時停止「リクエスト」用フラグ (0: 動作, 1: 停止リクエスト) */
+volatile uint32_t eviction_server_pause_request = 0;
+
+/* 退避サーバが実際に一時停止したことを示す「状態」フラグ (0: 動作中, 1: 停止中) */
+volatile uint32_t eviction_server_is_paused = 0;
+
+extern REF_WITH_CONTEXT *ref_list;
+extern size_t ref_count;
+
+void print_key_hex(const uint8_t *data, size_t size);
+void print_clear_page_info(WT_SESSION_IMPL *session, const char *title, WT_BTREE *btree, WT_REF *ref, int is_before);
+//void print_clear_page_info(const char *title, WT_BTREE *btree, WT_REF *ref, int is_before);
+void fprint_key_hex(FILE *fp, const uint8_t *key, size_t key_size);
+void write_metadata(const char *dbname);
+int hex_string_to_bytes(const char *hex_str, uint8_t *byte_array, size_t max_bytes);
+void read_metadata(const char *dbname);
+uint32_t my_count_all_keys_in_page(WT_REF *ref);
+
 /*
  * ext_collate --
  *     Call the collation function (external API version).
@@ -3402,6 +3420,271 @@ err:
         if (try_salvage)
             ret = WT_TRY_SALVAGE;
     }
+
+    return (ret);
+}
+
+#include "../../my_cache/management.h" // 自作のヘッダーファイル
+#include <unistd.h> // usleep を使うために必要
+
+extern CACHE_PAGE_INFO *metadata_list;
+extern size_t metadata_count;
+extern size_t metadata_capacity;
+
+void print_key_hex(const uint8_t *data, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+        printf("%02x ", data[i]);
+    }
+}
+
+/* 退避サーバを一時停止させ、実際に停止するまで待機するAPI */
+int wt_pause_eviction_server(WT_CONNECTION *connection) {
+    int timeout_ms = 5000; // 最大5秒待つ
+    (void)connection;
+
+    /* 1. まず、「停止中」フラグをクリアしておく */
+    __wt_atomic_store32((uint32_t *)&eviction_server_is_paused, 0);
+
+    /* 2. 次に、サーバに「停止リクエスト」を送る */
+    __wt_atomic_store32((uint32_t *)&eviction_server_pause_request, 1);
+
+    /* 3. サーバが「停止中」フラグを立てるまで待機する */
+    while (__wt_atomic_load32((uint32_t *)&eviction_server_is_paused) == 0) {
+        usleep(10 * 1000);
+        timeout_ms -= 10;
+        if (timeout_ms <= 0) {
+            fprintf(stderr, "Timeout waiting for eviction server to pause.\n");
+            return (ETIMEDOUT);
+        }
+    }
+    return (0);
+}
+
+/* 退避サーバを再開させるAPI */
+int wt_resume_eviction_server(WT_CONNECTION *connection) {
+    (void)connection;
+    /* サーバへの「停止リクエスト」を解除する */
+    __wt_atomic_store32((uint32_t *)&eviction_server_pause_request, 0);
+    return (0);
+}
+
+//キー（バイナリデータ）を16進数文字列としてファイルに書き込むヘルパー関数
+void fprint_key_hex(FILE *fp, const uint8_t *key, size_t key_size)
+{
+    size_t i;
+    for (i = 0; i < key_size; ++i) {
+        fprintf(fp, "%02x", key[i]);
+    }
+}
+
+void write_metadata(const char *dbname)
+{
+    size_t i;
+    char fname[256];
+    FILE *fp;
+
+    snprintf(fname, sizeof(fname), "%s/my_metadata.txt", dbname);
+    fp = fopen(fname, "w");
+    if (fp == NULL) {
+        printf("Error: File not open.\n");
+        return; 
+    }
+    for(i = 0; i < metadata_count; i++){
+        fprintf(fp, "%s\t", metadata_list[i].uri);
+        fprintf(fp, "%lu\t", metadata_list[i].parent_page_addr);
+        fprint_key_hex(fp, metadata_list[i].child_key, metadata_list[i].child_key_size);
+        fprintf(fp, "\t%zu\t", metadata_list[i].child_key_size);
+        fprintf(fp, "%zu\t", metadata_list[i].key_entries);
+        fprintf(fp, "%zu\t", metadata_list[i].page_size);
+        fprintf(fp, "%lu\t", metadata_list[i].page_disk_offset);
+        fprintf(fp, "%zu\n", metadata_list[i].page_disk_size);
+    }
+    fclose(fp);
+    return;
+}
+
+//16進数文字列をバイト配列に変換するヘルパー関数
+int hex_string_to_bytes(const char *hex_str, uint8_t *byte_array, size_t max_bytes) {
+    size_t len = strlen(hex_str);
+    if (len % 2 != 0) return -1; // 16進数文字列は2文字で1バイト
+
+    size_t byte_len = len / 2;
+    if (byte_len > max_bytes) byte_len = max_bytes; // バッファオーバーフローを防ぐ
+
+    size_t i;
+    for (i = 0; i < byte_len; i++) {
+        if (sscanf(hex_str + 2 * i, "%2hhx", &byte_array[i]) != 1) {
+            return -1; // 変換失敗
+        }
+    }
+    return (int)byte_len;
+}
+
+void read_metadata(const char *dbname)
+{
+    char fname[256];
+    FILE *fp;
+    char line_buffer[2048]; // 1行を読み込むための十分な大きさのバッファ
+
+    snprintf(fname, sizeof(fname), "%s/my_metadata.txt", dbname);
+    fp = fopen(fname, "r");
+    if (fp == NULL) {
+        printf("Error: File not open.\n");
+        return; 
+    }
+    metadata_capacity = 0;
+    metadata_count = 0;
+    metadata_list = NULL;
+    // ファイルを1行ずつ読み込む
+    while (fgets(line_buffer, sizeof(line_buffer), fp) != NULL) {
+        // メモリが足りなくなったら拡張する
+        if (metadata_count >= metadata_capacity) {
+            metadata_capacity = (metadata_capacity == 0) ? 1024 : metadata_capacity * 2;
+            metadata_list = realloc(metadata_list, sizeof(CACHE_PAGE_INFO) * metadata_capacity);
+        }
+        CACHE_PAGE_INFO *item = &metadata_list[metadata_count];
+        char temp_key_hex[513]; // child_keyの16進数文字列を一時的に保持 (256バイト -> 512文字 + 終端NULL)
+
+        // sscanfでタブ区切りの行をパースする
+        int parsed_count = sscanf(line_buffer,
+            "%255s\t%lu\t%512s\t%zu\t%zu\t%zu\t%lu\t%zu",
+            item->uri,
+            &item->parent_page_addr,
+            temp_key_hex,
+            &item->child_key_size,
+            &item->key_entries,
+            &item->page_size,
+            &item->page_disk_offset,
+            &item->page_disk_size);
+        
+        if (parsed_count == 8) {
+            // 16進数文字列をバイト配列に変換
+            hex_string_to_bytes(temp_key_hex, item->child_key, sizeof(item->child_key));
+            metadata_count++;
+        }
+    }
+    fclose(fp);
+    return;
+}
+
+/*
+ * グローバル変数に保存されたメタデータリストを元に、キャッシュを再構成（ウォームアップ）する
+ */
+int
+wt_reconstruct_cache(WT_CONNECTION *connection)
+{
+    WT_CONNECTION_IMPL *conn_impl;
+    WT_SESSION *session = NULL;
+    WT_CURSOR *cursor = NULL;
+    int ret = 0, tret;
+    char last_uri[256] = "", key_string_buffer[256];
+
+    conn_impl = (WT_CONNECTION_IMPL *)connection;
+
+    read_metadata(conn_impl->home);
+
+    // メタデータが保存されていなければ、何もせずに終了
+    if (metadata_list == NULL || metadata_count == 0) {
+        printf("No metadata to reconstruct from. Skipping reconstruction.\n");
+        return (0);
+    }
+
+    // この操作のための一時的なセッションを開く
+    if ((ret = conn_impl->iface.open_session(&conn_impl->iface, NULL, NULL, &session)) != 0)
+        goto cleanup;
+    
+    printf("Reconstructing cache from %zu metadata entries...\n", metadata_count);
+
+    // 保存したメタデータリストをループで処理する
+    for (size_t i = 0; i < metadata_count; ++i) {
+        //効率化のため、同じテーブルへのカーソルは開き直さずに使い回す
+        if (strcmp(last_uri, metadata_list[i].uri) != 0) {
+            if (cursor != NULL) (void)cursor->close(cursor);
+            
+            if ((ret = session->open_cursor(session, metadata_list[i].uri, NULL, NULL, &cursor)) != 0) {
+                fprintf(stderr, "Failed to open cursor on URI: %s\n", metadata_list[i].uri);
+                continue; // エラーでも次のページの処理を試みる
+            }
+            strncpy(last_uri, metadata_list[i].uri, sizeof(last_uri) - 1);
+        }
+
+        /*
+         * 保存しておいたキーを元にsearchを呼び出す。
+         * この操作により、そのキーが含まれるページがディスクから読み込まれ、
+         * キャッシュに載せられる（再構成される）。
+         */
+        memcpy(key_string_buffer, metadata_list[i].child_key, metadata_list[i].child_key_size);
+        key_string_buffer[metadata_list[i].child_key_size] = '\0'; // NULL終端文字を追加
+
+        /*
+         * 2. 文字列として直接cursor->set_keyに渡す。
+         * これにより、set_keyが内部でstrlen()を使い、正しいサイズを計算する。
+         */
+        cursor->set_key(cursor, key_string_buffer);
+        ret = cursor->search(cursor);
+
+        if (ret != 0 && ret != WT_NOTFOUND) {
+            fprintf(stderr, "Failed to search for key to reconstruct page.\n");
+        }
+
+        // leaf_page_maxを変えずにページを再構成するときに追加するコード
+        if (ret == 0) {  
+            /* searchが成功。最初のキーが読み込まれ、1ページ目がキャッシュに乗った */
+            size_t loaded_key_count = my_count_all_keys_in_page(((WT_CURSOR_BTREE *)cursor)->ref);
+            /*
+             * 保存しておいたキーの総数に達するまで cursor->next() を呼び出し続ける。
+             * これにより、分割された後続のページがキャッシュにロードされる。
+             */
+            while (loaded_key_count < metadata_list[i].key_entries) {
+                ret = cursor->next(cursor);
+                if (ret != 0) {
+                    /* テーブルの終端に達した(WT_NOTFOUND)か、エラーが発生した */
+                    if (ret != WT_NOTFOUND) {
+                        fprintf(stderr, "Error during cursor->next(): %s\n", wiredtiger_strerror(ret));
+                    }
+                    break; // ループを抜ける
+                }
+                loaded_key_count += my_count_all_keys_in_page(((WT_CURSOR_BTREE *)cursor)->ref);
+            }
+        }
+        //ここまで追加
+
+
+        // 再構成の結果を出力
+        /*
+        */
+        if (ret == 0) {
+            WT_CURSOR_BTREE *cbt = (WT_CURSOR_BTREE *)cursor;
+            WT_BTREE *btree = cbt->dhandle->handle;
+            WT_REF *ref = cbt->ref;
+            
+            // 既存の出力関数を呼び出して、詳細情報を表示
+            printf("\n===Reconstruction SUCCESS for key: %s===", key_string_buffer);
+            print_clear_page_info((WT_SESSION_IMPL *)session, "RECONSTRUCT", btree, ref, 2);
+
+        } else {
+            printf("\n -> Reconstruction FAILED for key: %s\n", key_string_buffer);
+            printf(" (Error: %s)\n", wiredtiger_strerror(ret));
+        }
+
+    }
+
+cleanup:
+    printf("=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= Reconstruction complete. ");
+    connection->debug_info(connection, "cache");
+    if (cursor != NULL)
+        (void)cursor->close(cursor);
+    
+    if (session != NULL)
+        if ((tret = session->close(session, NULL)) != 0 && ret == 0)
+            ret = tret;
+        
+    //重要：再構成が完了したら、グローバルリストが確保したメモリを解放し、カウンタをリセットして、次回の実行に備える。
+    if (metadata_list != NULL) {
+        free(metadata_list);
+        metadata_list = NULL;
+    }
+    metadata_count = 0;
 
     return (ret);
 }

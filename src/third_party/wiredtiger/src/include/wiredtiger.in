@@ -8856,6 +8856,44 @@ typedef enum {
 
 #undef __F
 
+int wt_clear_cache(WT_CONNECTION *connection);
+int wt_reconstruct_cache(WT_CONNECTION *connection);
+int wt_verify_reconstruction(WT_CONNECTION *connection);
+int print_reconstruct_cache(WT_CONNECTION *connection);
+int wt_collect_page_refs(WT_CONNECTION *connection);
+int wt_dump_pages_from_refs(WT_CONNECTION *connection);
+/* Custom APIs for cache control */
+int wt_pause_eviction_server(WT_CONNECTION *connection);
+int wt_resume_eviction_server(WT_CONNECTION *connection);
+int wt_print_eviction_thread_status(WT_CONNECTION *connection);
+typedef struct {
+    char     uri[256];         /* テーブル名 (URI) */
+    uint64_t parent_page_addr; /* 親ページのメモリアドレス (親子関係の識別に使う) */
+    uint8_t  child_key[256];   /* 子ページの最初のキー */
+    size_t   child_key_size;   /* キーのサイズ */
+    size_t   key_entries;   /* キーの総数 */
+    size_t   page_size;        /* メモリ上のページサイズ (memory_footprint) */
+    uint64_t page_disk_offset; /* ディスク上の物理オフセット */
+    size_t   page_disk_size;   /* ディスク上の物理サイズ */
+} CACHE_PAGE_INFO;
+
+typedef struct __wt_ref WT_REF;
+
+/* ページ参照とその所属テーブル(dhandle)をペアで保持する構造体 */
+typedef struct {
+    WT_REF *ref;
+    char *uri;
+} REF_WITH_CONTEXT;
+
+/* REF_WITH_CONTEXTのリストを管理するための構造体 */
+typedef struct {
+    REF_WITH_CONTEXT *list;
+    size_t count;
+    size_t capacity;
+} CONTEXT_COLLECTOR;
+
+int wt_save_cache_structure(WT_CONNECTION *connection, CACHE_PAGE_INFO **list_p, size_t *count_p);
+
 #if defined(__cplusplus)
 }
 #endif

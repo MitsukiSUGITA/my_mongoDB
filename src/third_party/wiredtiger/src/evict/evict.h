@@ -161,6 +161,7 @@ extern bool __wt_evict_page_urgent(WT_SESSION_IMPL *session, WT_REF *ref)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_evict(WT_SESSION_IMPL *session, WT_REF *ref, WT_REF_STATE previous_state,
   uint32_t flags) WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
+extern int __my_wt_evict(WT_SESSION_IMPL *session, WT_REF *ref, WT_REF_STATE previous_state, uint32_t flags) WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_evict_config(WT_SESSION_IMPL *session, const char *cfg[], bool reconfig)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_evict_create(WT_SESSION_IMPL *session, const char *cfg[])
@@ -212,6 +213,7 @@ static WT_INLINE void __wt_evict_page_soon(WT_SESSION_IMPL *session, WT_REF *ref
 static WT_INLINE void __wt_evict_touch_page(
   WT_SESSION_IMPL *session, WT_PAGE *page, bool internal_only, bool wont_need);
 
+extern bool clearing_cache;
 #ifdef HAVE_UNITTEST
 
 #endif

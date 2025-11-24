@@ -7,6 +7,7 @@
  */
 
 #include "wt_internal.h"
+extern void start_qemu_monitor(WT_CONNECTION *conn);
 
 /*
  * __wti_connection_open --
@@ -289,6 +290,9 @@ __wti_connection_workers(WT_SESSION_IMPL *session, const char *cfg[])
 
     __wt_verbose_info(
       session, WT_VERB_RECOVERY, "%s", "WiredTiger utility threads started successfully");
+
+    // ★追加: QEMU監視スレッドの起動(session->iface.connection で WT_CONNECTION* を取得して渡す)
+    //start_qemu_monitor(session->iface.connection);
 
     return (0);
 }

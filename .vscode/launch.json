@@ -1,0 +1,48 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "(sudo) Launch mongod",
+            "type": "cppdbg",
+            "request": "launch",
+            // ★重要: アタッチではなく「起動」を使います
+            
+            // ビルドされたバイナリの正しいパス
+            "program": "/home/mitsuki/mongo/bazel-bin/install-dist-test/bin/mongod",
+            
+            // 起動引数 (--fork は絶対に付けない！)
+            "args": [
+                "--dbpath", "/tmp/mongo_debug_db",
+                "--port", "27017",
+                "--bind_ip", "127.0.0.1"
+            ],
+            
+            "stopAtEntry": false,
+            "cwd": "/home/mitsuki/mongo",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            
+            // ★重要: あなたの作成した sudo ラッパー経由で起動
+            "miDebuggerPath": "/home/mitsuki/mongo/src/third_party/wiredtiger/src/my_func/gdb-sudo.sh",
+            
+            "sourceFileMap": {
+                "/proc/self/cwd": "${workspaceFolder}",
+                "src": "${workspaceFolder}/src"
+            },
+            
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Ignore SIGUSR1",
+                    "text": "handle SIGUSR1 nostop print pass",
+                    "ignoreFailures": true
+                }
+            ]
+        }
+    ]
+}

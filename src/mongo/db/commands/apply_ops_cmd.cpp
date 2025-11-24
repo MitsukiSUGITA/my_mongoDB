@@ -50,7 +50,15 @@
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
-
+//TCMalloc拡張機能
+#include "third_party/tcmalloc/dist/tcmalloc/malloc_extension.h"
+//#include "cache_clear_and_reconstruct.cpp"
+#include <fstream>
+#include <iostream>
+#include <wiredtiger.h>
+#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h" 
+#include "mongo/db/storage/wiredtiger/wiredtiger_connection.h"
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 #include <cstddef>
 #include <stack>
 #include <string>
@@ -302,4 +310,147 @@ public:
 MONGO_REGISTER_COMMAND(ApplyOpsCmd).forShard();
 
 }  // namespace
+// 必要なヘッダを明示的にインクルード
+#include "mongo/db/operation_context.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/kv/kv_engine.h" 
+#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h" 
+#include "mongo/db/storage/wiredtiger/wiredtiger_connection.h"
+#include <wiredtiger.h>
+
+// ヘルパー関数 (無名名前空間で隠蔽)
+namespace {
+    WT_CONNECTION* getWiredTigerConnection_Custom(OperationContext* opCtx) {
+        // 1. StorageEngine (ラッパー) を取得
+        StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
+        if (!storageEngine) return nullptr;
+        
+        // 2. KVEngine (実体) を取得
+        // StorageEngine は KVEngine を持っている構造なので、getEngine() で取り出します
+        KVEngine* kvEngine = storageEngine->getEngine();
+        if (!kvEngine) return nullptr;
+
+        // 3. WiredTigerKVEngine にダウンキャスト
+        // KVEngine は WiredTigerKVEngine の親クラスなので static_cast が通ります
+        auto wtEngine = static_cast<WiredTigerKVEngine*>(kvEngine);
+        if (!wtEngine) return nullptr;
+        
+        // 4. 接続を取得 (参照からポインタを取り出す)
+        auto& wrapper = wtEngine->getConnection();
+        return wrapper.conn();
+    }
+}
+
+// 起動確認用イニシャライザ
+MONGO_INITIALIZER(RegisterCustomCacheCommands)(InitializerContext* context) {
+    std::ofstream outfile("/tmp/mongo_custom_check.txt");
+    if (outfile.is_open()) {
+        outfile << "Custom Cache Commands are LINKED and RUNNING!" << std::endl;
+        outfile.close();
+    }
+    std::cout << "\n[CUSTOM DEBUG] Custom Cache Commands Initialized (Correct Cast).\n" << std::endl;
+}
+
+// コマンド1: customClear
+class CustomClearCacheCmd : public BasicCommand {
+public:
+    CustomClearCacheCmd() : BasicCommand("customClear") {}
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override { return AllowedOnSecondary::kNever; }
+    Status checkAuthForOperation(OperationContext*, const DatabaseName&, const BSONObj&) const override { return Status::OK(); }
+    bool supportsWriteConcern(const BSONObj&) const override { return false; }
+    bool adminOnly() const override { return true; }
+    bool run(OperationContext* opCtx, const DatabaseName&, const BSONObj&, BSONObjBuilder& result) override {
+        
+        // ★修正した関数を使用
+        WT_CONNECTION* conn = getWiredTigerConnection_Custom(opCtx);
+        
+        if (!conn) {
+            result.append("ok", 0.0);
+            result.append("errmsg", "Failed to get WiredTiger connection (getEngine failed)");
+            return false;
+        }
+
+        // C関数呼び出し
+        int ret = wt_clear_cache(conn);
+        
+        // キャッシュクリア成功後にメモリを強制解放
+        // ▼▼▼ 修正: TCMalloc 統計をファイルに出力してメモリ解放 ▼▼▼
+        /*
+        if (ret == 0) {
+            // 出力先ファイルを開く (追記モード)
+            std::ofstream logFile("/tmp/mongo_migration_test/tcmalloc_stats.log", std::ios::app);
+            
+            if (logFile.is_open()) {
+                logFile << "=== [CustomClear] Start Memory Release ===" << std::endl;
+
+                // 1. 解放前の統計を取得・出力
+                // (GetStatsの戻り値が std::string である前提)
+                std::string statsBefore = tcmalloc::MallocExtension::GetStats();
+                logFile << "--- Stats BEFORE Release ---" << std::endl;
+                logFile << statsBefore << std::endl;
+
+                // 2. メモリ解放を実行
+                logFile << ">>> Calling ReleaseMemoryToSystem(-1)..." << std::endl;
+                size_t max_bytes = static_cast<size_t>(-1);
+                tcmalloc::MallocExtension::ReleaseMemoryToSystem(max_bytes);
+
+                // 3. 解放後の統計を取得・出力
+                std::string statsAfter = tcmalloc::MallocExtension::GetStats();
+                logFile << "--- Stats AFTER Release ---" << std::endl;
+                logFile << statsAfter << std::endl;
+                
+                logFile << "==========================================" << std::endl << std::endl;
+                logFile.close();
+            } else {
+                // ファイルが開けなかった場合は標準ログに出す（バックアップ）
+                LOGV2(0, "Failed to open log file /tmp/mongo_migration_test/tcmalloc_stats.log");
+            }
+        }
+        */
+        // ▲▲▲ 修正終了 ▲▲▲
+
+        if (ret == 0) {
+            result.append("msg", "Successfully executed wt_clear_cache");
+            return true;
+        } else {
+            result.append("ok", 0.0);
+            result.append("errmsg", wiredtiger_strerror(ret));
+            return false;
+        }
+    }
+};
+MONGO_REGISTER_COMMAND(CustomClearCacheCmd).forShard();
+
+// コマンド2: customReconstruct
+class CustomReconstructCacheCmd : public BasicCommand {
+public:
+    CustomReconstructCacheCmd() : BasicCommand("customReconstruct") {}
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override { return AllowedOnSecondary::kNever; }
+    Status checkAuthForOperation(OperationContext*, const DatabaseName&, const BSONObj&) const override { return Status::OK(); }
+    bool supportsWriteConcern(const BSONObj&) const override { return false; }
+    bool adminOnly() const override { return true; }
+    bool run(OperationContext* opCtx, const DatabaseName&, const BSONObj&, BSONObjBuilder& result) override {
+        
+        WT_CONNECTION* conn = getWiredTigerConnection_Custom(opCtx);
+        
+        if (!conn) {
+            result.append("ok", 0.0);
+            result.append("errmsg", "Failed to get WiredTiger connection (getEngine failed)");
+            return false;
+        }
+
+        int ret = wt_reconstruct_cache(conn);
+
+        if (ret == 0) {
+            result.append("msg", "Successfully executed wt_reconstruct_cache");
+            return true;
+        } else {
+            result.append("ok", 0.0);
+            result.append("errmsg", wiredtiger_strerror(ret));
+            return false;
+        }
+    }
+};
+MONGO_REGISTER_COMMAND(CustomReconstructCacheCmd).forShard();
+
 }  // namespace mongo

@@ -34,6 +34,8 @@ __evict_exclusive(WT_SESSION_IMPL *session, WT_REF *ref)
 {
     WT_ASSERT(session, WT_REF_GET_STATE(ref) == WT_REF_LOCKED);
 
+    if (clearing_cache == true)
+        return (0);
     /*
      * Check for a hazard pointer indicating another thread is using the page, meaning the page
      * cannot be evicted.
@@ -231,7 +233,7 @@ __wt_evict(WT_SESSION_IMPL *session, WT_REF *ref, WT_REF_STATE previous_state, u
      * If we decide to do an in-memory split. Do it now. If an in-memory split completes, the page
      * stays in memory and the tree is left in the desired state: avoid the usual cleanup.
      */
-    if (inmem_split) {
+    if (!clearing_cache && inmem_split) {
         WT_ERR(__wt_split_insert(session, ref));
         goto done;
     }
@@ -251,10 +253,12 @@ __wt_evict(WT_SESSION_IMPL *session, WT_REF *ref, WT_REF_STATE previous_state, u
      * should be able to evict anything if we are closing the dhandle and when the dhandle is
      * already dead.
      */
+    if(clearing_cache == false){
     WT_ASSERT(session,
       closing || !F_ISSET(ref, WT_REF_FLAG_INTERNAL) ||
         F_ISSET(session->dhandle, WT_DHANDLE_DEAD) ||
         !__wt_gen_active(session, WT_GEN_SPLIT, page->pg_intl_split_gen));
+    }
 
     /* Count evictions of internal pages during normal operation. */
     if (!closing && F_ISSET(ref, WT_REF_FLAG_INTERNAL))

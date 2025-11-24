@@ -1,0 +1,1 @@
+common --//bazel/config:running_through_bazelisk

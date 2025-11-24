@@ -1,0 +1,11 @@
+# Generated file, do not modify
+common --bes_keywords=developerBuild=True
+common --bes_keywords=user_email=s229583@st.go.tuat.ac.jp
+common --bes_keywords=operating_system=linux
+common --bes_keywords=engflow:BuildScmRemote=https://github.com/MitsukiSUGITA/my_mongoDB.git
+common --bes_keywords=engflow:BuildScmBranch=main
+common --bes_keywords=engflow:BuildScmRevision=ba594c1dcffc7ef59b7e09aceb3dd79e4ce2128d
+common --bes_keywords=engflow:BuildScmStatus=modified
+common --bes_keywords=rawCommandLineBase64=L2hvbWUvbWl0c3VraS8uY2FjaGUvYmF6ZWxpc2svZG93bmxvYWRzL3NoYTI1Ni9mMDc5N2EwYjc1ZjRlNWRjODliY2JiYjNhOWMxMGVkYzA5MjBlZTcwZjQ2Y2U5MmQ1YmFlZDAyMWVlNGFkNmVmL2Jpbi9iYXplbCBidWlsZCBpbnN0YWxsLWRpc3QtdGVzdCAtLWJ1aWxkX2VudGVycHJpc2U9RmFsc2UgLS1jb25maWc9bG9jYWw=
+common --bes_keywords=workstation=higashikoganei
+common --remote_execution_priority=5

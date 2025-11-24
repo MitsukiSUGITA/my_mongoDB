@@ -3424,7 +3424,7 @@ err:
     return (ret);
 }
 
-#include "../../my_cache/management.h" // 自作のヘッダーファイル
+#include <management.h> // 自作のヘッダーファイル
 #include <unistd.h> // usleep を使うために必要
 
 extern CACHE_PAGE_INFO *metadata_list;

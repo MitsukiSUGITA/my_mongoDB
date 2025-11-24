@@ -1400,19 +1400,9 @@ __evict_lru_pages(WT_SESSION_IMPL *session, bool is_server)
      * Reconcile and discard some pages: EBUSY is returned if a page fails eviction because it's
      * unavailable, continue in that case.
      */
-    /*
     while (FLD_ISSET(conn->server_flags, WT_CONN_SERVER_EVICTION) && ret == 0)
         if ((ret = __evict_page(session, is_server)) == EBUSY)
             ret = 0;
-    */
-
-    while (F_ISSET_ATOMIC_32(conn, WT_CONN_EVICTION_RUN) && ret == 0){
-        //1ページだけのクリア＆再構成のためのコード追加
-        //if (clearing_cache == true && metadata_count != 0) return 0;
-
-        if ((ret = __evict_page(session, is_server)) == EBUSY)
-            ret = 0;
-    }
 
     /* If any resources are pinned, release them now. */
     WT_TRET(__wt_session_release_resources(session));
@@ -3597,10 +3587,11 @@ int __my_evict_walk_tree(WT_SESSION_IMPL *session, WTI_EVICT_QUEUE *queue, u_int
     uint64_t internal_pages_already_queued, internal_pages_queued, internal_pages_seen;
     //uint64_t min_pages, pages_already_queued, pages_queued, pages_seen, refs_walked;
     uint64_t pages_already_queued, pages_queued, pages_seen, refs_walked;
+    uint64_t pages_seen_clean, pages_seen_dirty, pages_seen_updates;
     //uint32_t evict_walk_period, target_pages, walk_flags;
     uint32_t target_pages, walk_flags;
-    //bool give_up, queued, urgent_queued;
     int restarts;
+    //bool give_up, queued, urgent_queued;
     bool queued;
 
     conn = S2C(session);
@@ -3705,12 +3696,31 @@ int __my_evict_walk_tree(WT_SESSION_IMPL *session, WTI_EVICT_QUEUE *queue, u_int
          * statistic here during the walk and not at __evict_page because the evict_pass_gen is
          * reset here.
          */
-        const uint64_t gen_gap = __wt_atomic_load64(&evict->evict_pass_gen) - page->evict_pass_gen;
-        if (gen_gap > __wt_atomic_load64(&evict->evict_max_gen_gap))
-            __wt_atomic_store64(&evict->evict_max_gen_gap, gen_gap);
+        if (page->evict_pass_gen == 0) {
+            const uint64_t gen_gap =
+              __wt_atomic_load64(&evict->evict_pass_gen) - page->cache_create_gen;
+            if (gen_gap > __wt_atomic_load64(&evict->evict_max_unvisited_gen_gap))
+                __wt_atomic_store64(&evict->evict_max_unvisited_gen_gap, gen_gap);
+            if (gen_gap > __wt_atomic_load64(&evict->evict_max_unvisited_gen_gap_per_checkpoint))
+                __wt_atomic_store64(&evict->evict_max_unvisited_gen_gap_per_checkpoint, gen_gap);
+        } else {
+            const uint64_t gen_gap =
+              __wt_atomic_load64(&evict->evict_pass_gen) - page->evict_pass_gen;
+            if (gen_gap > __wt_atomic_load64(&evict->evict_max_visited_gen_gap))
+                __wt_atomic_store64(&evict->evict_max_visited_gen_gap, gen_gap);
+            if (gen_gap > __wt_atomic_load64(&evict->evict_max_visited_gen_gap_per_checkpoint))
+                __wt_atomic_store64(&evict->evict_max_visited_gen_gap_per_checkpoint, gen_gap);
+        }
 
         page->evict_pass_gen = __wt_atomic_load64(&evict->evict_pass_gen);
 
+        if (__wt_page_is_modified(page))
+            ++pages_seen_dirty;
+        else if (page->modify != NULL)
+            ++pages_seen_updates;
+        else
+            ++pages_seen_clean;
+        
         /* Count internal pages seen. */
         if (F_ISSET(ref, WT_REF_FLAG_INTERNAL))
             internal_pages_seen++;
@@ -3831,6 +3841,9 @@ int __my_evict_walk_tree(WT_SESSION_IMPL *session, WTI_EVICT_QUEUE *queue, u_int
       session, eviction_internal_pages_already_queued, internal_pages_already_queued);
     WT_STAT_CONN_INCRV(session, eviction_internal_pages_queued, internal_pages_queued);
     WT_STAT_CONN_DSRC_INCR(session, eviction_walk_passes);
+    WT_STAT_CONN_DSRC_INCRV(session, cache_eviction_pages_seen_clean, pages_seen_clean);
+    WT_STAT_CONN_DSRC_INCRV(session, cache_eviction_pages_seen_dirty, pages_seen_dirty);
+    WT_STAT_CONN_DSRC_INCRV(session, cache_eviction_pages_seen_updates, pages_seen_updates);
     return (0);
 }
 
@@ -3958,6 +3971,10 @@ __my_evict_lru_walk(WT_SESSION_IMPL *session)
     // ▼▼▼ ソート処理を自作の比較関数で復活させる ▼▼▼
     __wt_qsort(queue->evict_queue, entries, sizeof(WTI_EVICT_ENTRY), my_evict_cmp);
 
+    /*
+     * Style note: __wt_qsort is a macro that can leave a dangling else. Full curly braces are
+     * needed here for the compiler.
+     */
     /*    
     if (FLD_ISSET(conn->debug_flags, WT_CONN_DEBUG_EVICT_AGGRESSIVE_MODE)) {
         __wt_qsort(queue->evict_queue, entries, sizeof(WTI_EVICT_ENTRY), __evict_lru_cmp_debug);
@@ -3967,9 +3984,15 @@ __my_evict_lru_walk(WT_SESSION_IMPL *session)
     */
 
     //候補リストの後始末をする。空のエントリを削除したり、リストのサイズを調整したりする。
+    /* Trim empty entries from the end. */
     while (entries > 0 && queue->evict_queue[entries - 1].ref == NULL)
         --entries;
 
+    /*
+     * If we have more entries than the maximum tracked between walks, clear them. Do this before
+     * figuring out how many of the entries are candidates so we never end up with more candidates
+     * than entries.
+     */
     /*
     while (entries > WTI_EVICT_WALK_BASE)
         __evict_list_clear(session, &queue->evict_queue[--entries]);
@@ -3992,6 +4015,9 @@ __my_evict_lru_walk(WT_SESSION_IMPL *session)
     queue->evict_current = queue->evict_queue;
     __wt_spin_unlock(session, &queue->evict_lock);
 
+    /*
+     * Signal any application or helper threads that may be waiting to help with eviction.
+     */
     __wt_cond_signal(session, conn->evict_threads.wait_cond);
 
 err:

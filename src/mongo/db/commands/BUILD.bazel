@@ -1581,14 +1581,15 @@ mongo_cc_library(
         "vote_abort_index_build_command.cpp",
         "vote_commit_index_build_command.cpp",
         "vote_index_build_gen",
-        "//src/mongo/db/commands/query_cmd:change_stream_state_command.cpp",
-        "//src/mongo/db/commands/query_cmd:map_reduce_command.cpp",
+        # "//src/mongo/db/commands/query_cmd:change_stream_state_command.cpp",
+        # "//src/mongo/db/commands/query_cmd:map_reduce_command.cpp",
     ],
     hdrs = [
         "auto_compact.h",
         "oplog_application_checks.h",
         "//src/mongo/db/commands/query_cmd:map_reduce_command_base.h",
         "//src/mongo/s/commands:internal_transactions_test_command.h",
+        # "cache_clear_and_reconstruct.cpp",
     ],
     deps = [
         "cluster_server_parameter_commands_invocation",
@@ -1663,6 +1664,8 @@ mongo_cc_library(
         "//src/mongo/executor:inline_executor",
         "//src/mongo/util:progress_meter",
         "//src/mongo/util/net:ssl_manager",
+        "//src/mongo/db/storage/wiredtiger:storage_wiredtiger_core",
+        # "//src/third_party/wiredtiger:wiredtiger",
     ] + select({
         "//bazel/config:enterprise_feature_live_import_enabled": [
             "//src/mongo/db/modules/enterprise/src/live_import/commands:export_collection_command",

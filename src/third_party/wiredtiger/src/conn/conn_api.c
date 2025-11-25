@@ -3570,121 +3570,69 @@ void read_metadata(const char *dbname)
 /*
  * グローバル変数に保存されたメタデータリストを元に、キャッシュを再構成（ウォームアップ）する
  */
+/* 安全な wt_reconstruct_cache 実装 */
 int
 wt_reconstruct_cache(WT_CONNECTION *connection)
 {
-    WT_CONNECTION_IMPL *conn_impl;
     WT_SESSION *session = NULL;
     WT_CURSOR *cursor = NULL;
-    int ret = 0, tret;
-    char last_uri[256] = "", key_string_buffer[256];
+    int ret = 0;
+    char last_uri[256] = "";
+    
+    // バイナリデータを扱うためのキー用アイテム
+    WT_ITEM key_item;
 
-    conn_impl = (WT_CONNECTION_IMPL *)connection;
-
-    read_metadata(conn_impl->home);
-
-    // メタデータが保存されていなければ、何もせずに終了
+    // メモリ上のグローバル変数をチェック
     if (metadata_list == NULL || metadata_count == 0) {
-        printf("No metadata to reconstruct from. Skipping reconstruction.\n");
+        printf("No metadata in memory. Skipping reconstruction.\n");
         return (0);
     }
 
-    // この操作のための一時的なセッションを開く
-    if ((ret = conn_impl->iface.open_session(&conn_impl->iface, NULL, NULL, &session)) != 0)
-        goto cleanup;
-    
-    printf("Reconstructing cache from %zu metadata entries...\n", metadata_count);
+    // 1. セッションを開く (公開API)
+    if ((ret = connection->open_session(connection, NULL, NULL, &session)) != 0) {
+        fprintf(stderr, "Error: open_session failed: %s\n", wiredtiger_strerror(ret));
+        return (ret);
+    }
 
-    // 保存したメタデータリストをループで処理する
+    printf("Reconstructing %zu pages from memory list...\n", metadata_count);
+
+    // 2. リストをループしてページをタッチする
     for (size_t i = 0; i < metadata_count; ++i) {
-        //効率化のため、同じテーブルへのカーソルは開き直さずに使い回す
+        
+        // URIが変わったらカーソルを開き直す
         if (strcmp(last_uri, metadata_list[i].uri) != 0) {
-            if (cursor != NULL) (void)cursor->close(cursor);
-            
+            if (cursor != NULL) {
+                cursor->close(cursor);
+                cursor = NULL;
+            }
             if ((ret = session->open_cursor(session, metadata_list[i].uri, NULL, NULL, &cursor)) != 0) {
-                fprintf(stderr, "Failed to open cursor on URI: %s\n", metadata_list[i].uri);
-                continue; // エラーでも次のページの処理を試みる
+                // インデックスやメタデータテーブルなど、開けないものはスキップして続行
+                continue; 
             }
             strncpy(last_uri, metadata_list[i].uri, sizeof(last_uri) - 1);
         }
 
-        /*
-         * 保存しておいたキーを元にsearchを呼び出す。
-         * この操作により、そのキーが含まれるページがディスクから読み込まれ、
-         * キャッシュに載せられる（再構成される）。
-         */
-        memcpy(key_string_buffer, metadata_list[i].child_key, metadata_list[i].child_key_size);
-        key_string_buffer[metadata_list[i].child_key_size] = '\0'; // NULL終端文字を追加
+        if (cursor == NULL) continue;
 
-        /*
-         * 2. 文字列として直接cursor->set_keyに渡す。
-         * これにより、set_keyが内部でstrlen()を使い、正しいサイズを計算する。
-         */
-        cursor->set_key(cursor, key_string_buffer);
+        // キーを設定 (バイナリセーフ)
+        key_item.data = metadata_list[i].child_key;
+        key_item.size = metadata_list[i].child_key_size;
+        cursor->set_key(cursor, &key_item);
+
+        // ★★★ 検索実行！これでデータがキャッシュに乗ります ★★★
         ret = cursor->search(cursor);
-
-        if (ret != 0 && ret != WT_NOTFOUND) {
-            fprintf(stderr, "Failed to search for key to reconstruct page.\n");
-        }
-
-        // leaf_page_maxを変えずにページを再構成するときに追加するコード
-        if (ret == 0) {  
-            /* searchが成功。最初のキーが読み込まれ、1ページ目がキャッシュに乗った */
-            size_t loaded_key_count = my_count_all_keys_in_page(((WT_CURSOR_BTREE *)cursor)->ref);
-            /*
-             * 保存しておいたキーの総数に達するまで cursor->next() を呼び出し続ける。
-             * これにより、分割された後続のページがキャッシュにロードされる。
-             */
-            while (loaded_key_count < metadata_list[i].key_entries) {
-                ret = cursor->next(cursor);
-                if (ret != 0) {
-                    /* テーブルの終端に達した(WT_NOTFOUND)か、エラーが発生した */
-                    if (ret != WT_NOTFOUND) {
-                        fprintf(stderr, "Error during cursor->next(): %s\n", wiredtiger_strerror(ret));
-                    }
-                    break; // ループを抜ける
-                }
-                loaded_key_count += my_count_all_keys_in_page(((WT_CURSOR_BTREE *)cursor)->ref);
-            }
-        }
-        //ここまで追加
-
-
-        // 再構成の結果を出力
-        /*
-        */
-        if (ret == 0) {
-            WT_CURSOR_BTREE *cbt = (WT_CURSOR_BTREE *)cursor;
-            WT_BTREE *btree = cbt->dhandle->handle;
-            WT_REF *ref = cbt->ref;
-            
-            // 既存の出力関数を呼び出して、詳細情報を表示
-            printf("\n===Reconstruction SUCCESS for key: %s===", key_string_buffer);
-            print_clear_page_info((WT_SESSION_IMPL *)session, "RECONSTRUCT", btree, ref, 2);
-
-        } else {
-            printf("\n -> Reconstruction FAILED for key: %s\n", key_string_buffer);
-            printf(" (Error: %s)\n", wiredtiger_strerror(ret));
-        }
-
-    }
-
-cleanup:
-    printf("=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= Reconstruction complete. ");
-    connection->debug_info(connection, "cache");
-    if (cursor != NULL)
-        (void)cursor->close(cursor);
-    
-    if (session != NULL)
-        if ((tret = session->close(session, NULL)) != 0 && ret == 0)
-            ret = tret;
         
-    //重要：再構成が完了したら、グローバルリストが確保したメモリを解放し、カウンタをリセットして、次回の実行に備える。
-    if (metadata_list != NULL) {
-        free(metadata_list);
-        metadata_list = NULL;
+        // 結果はチェックしなくてOK (キャッシュに乗ればよいので)
+        if (ret != 0 && ret != WT_NOTFOUND) {
+             // エラーハンドリングが必要ならここに
+        }
     }
-    metadata_count = 0;
 
-    return (ret);
+    // クリーンアップ
+    if (cursor != NULL) cursor->close(cursor);
+    if (session != NULL) session->close(session, NULL);
+
+    // ※ ここでもまだ free はしないでおく (何度でもテストできるように)
+
+    return (0);
 }

@@ -4516,11 +4516,13 @@ wt_clear_cache(WT_CONNECTION *connection)
 
     write_metadata(conn_impl->home);
     //重要：再構成が完了したら、グローバルリストが確保したメモリを解放し、カウンタをリセットして、次回の実行に備える。
+    /*
     if (metadata_list != NULL) {
         free(metadata_list);
         metadata_list = NULL;
     }
     metadata_count = 0;
+    */
 
     return (ret);
 }

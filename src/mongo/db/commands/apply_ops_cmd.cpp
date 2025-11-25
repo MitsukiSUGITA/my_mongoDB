@@ -50,6 +50,12 @@
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
+//#include "cache_clear_and_reconstruct.cpp"
+#include <fstream>
+#include <iostream>
+#include <wiredtiger.h>
+#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h" 
+#include "mongo/db/storage/wiredtiger/wiredtiger_connection.h"
 
 #include <cstddef>
 #include <stack>
@@ -302,4 +308,111 @@ public:
 MONGO_REGISTER_COMMAND(ApplyOpsCmd).forShard();
 
 }  // namespace
+// 必要なヘッダを明示的にインクルード
+#include "mongo/db/operation_context.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/kv/kv_engine.h" 
+#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h" 
+#include "mongo/db/storage/wiredtiger/wiredtiger_connection.h"
+#include <wiredtiger.h>
+
+// ヘルパー関数 (無名名前空間で隠蔽)
+namespace {
+    WT_CONNECTION* getWiredTigerConnection_Custom(OperationContext* opCtx) {
+        // 1. StorageEngine (ラッパー) を取得
+        StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
+        if (!storageEngine) return nullptr;
+        
+        // 2. KVEngine (実体) を取得
+        // StorageEngine は KVEngine を持っている構造なので、getEngine() で取り出します
+        KVEngine* kvEngine = storageEngine->getEngine();
+        if (!kvEngine) return nullptr;
+
+        // 3. WiredTigerKVEngine にダウンキャスト
+        // KVEngine は WiredTigerKVEngine の親クラスなので static_cast が通ります
+        auto wtEngine = static_cast<WiredTigerKVEngine*>(kvEngine);
+        if (!wtEngine) return nullptr;
+        
+        // 4. 接続を取得 (参照からポインタを取り出す)
+        auto& wrapper = wtEngine->getConnection();
+        return wrapper.conn();
+    }
+}
+
+// 起動確認用イニシャライザ
+MONGO_INITIALIZER(RegisterCustomCacheCommands)(InitializerContext* context) {
+    std::ofstream outfile("/tmp/mongo_custom_check.txt");
+    if (outfile.is_open()) {
+        outfile << "Custom Cache Commands are LINKED and RUNNING!" << std::endl;
+        outfile.close();
+    }
+    std::cout << "\n[CUSTOM DEBUG] Custom Cache Commands Initialized (Correct Cast).\n" << std::endl;
+}
+
+// コマンド1: customClear
+class CustomClearCacheCmd : public BasicCommand {
+public:
+    CustomClearCacheCmd() : BasicCommand("customClear") {}
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override { return AllowedOnSecondary::kNever; }
+    Status checkAuthForOperation(OperationContext*, const DatabaseName&, const BSONObj&) const override { return Status::OK(); }
+    bool supportsWriteConcern(const BSONObj&) const override { return false; }
+    bool adminOnly() const override { return true; }
+    bool run(OperationContext* opCtx, const DatabaseName&, const BSONObj&, BSONObjBuilder& result) override {
+        
+        // ★修正した関数を使用
+        WT_CONNECTION* conn = getWiredTigerConnection_Custom(opCtx);
+        
+        if (!conn) {
+            result.append("ok", 0.0);
+            result.append("errmsg", "Failed to get WiredTiger connection (getEngine failed)");
+            return false;
+        }
+
+        // C関数呼び出し
+        int ret = wt_clear_cache(conn);
+        
+        if (ret == 0) {
+            result.append("msg", "Successfully executed wt_clear_cache");
+            return true;
+        } else {
+            result.append("ok", 0.0);
+            result.append("errmsg", wiredtiger_strerror(ret));
+            return false;
+        }
+    }
+};
+MONGO_REGISTER_COMMAND(CustomClearCacheCmd).forShard();
+
+// コマンド2: customReconstruct
+class CustomReconstructCacheCmd : public BasicCommand {
+public:
+    CustomReconstructCacheCmd() : BasicCommand("customReconstruct") {}
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override { return AllowedOnSecondary::kNever; }
+    Status checkAuthForOperation(OperationContext*, const DatabaseName&, const BSONObj&) const override { return Status::OK(); }
+    bool supportsWriteConcern(const BSONObj&) const override { return false; }
+    bool adminOnly() const override { return true; }
+    bool run(OperationContext* opCtx, const DatabaseName&, const BSONObj&, BSONObjBuilder& result) override {
+        
+        WT_CONNECTION* conn = getWiredTigerConnection_Custom(opCtx);
+        
+        if (!conn) {
+            result.append("ok", 0.0);
+            result.append("errmsg", "Failed to get WiredTiger connection (getEngine failed)");
+            return false;
+        }
+
+        int ret = wt_reconstruct_cache(conn);
+
+        if (ret == 0) {
+            result.append("msg", "Successfully executed wt_reconstruct_cache");
+            return true;
+        } else {
+            result.append("ok", 0.0);
+            result.append("errmsg", wiredtiger_strerror(ret));
+            return false;
+        }
+    }
+};
+MONGO_REGISTER_COMMAND(CustomReconstructCacheCmd).forShard();
+
 }  // namespace mongo

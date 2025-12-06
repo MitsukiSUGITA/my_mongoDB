@@ -6,14 +6,40 @@
  * See the file LICENSE for redistribution information.
  */
 
+#define _GNU_SOURCE 1
 #include "wt_internal.h"
 
+#include <sys/io.h>
+#include <sys/mman.h> // mmap用
+#include <stdarg.h> // va_list用
+
+#define MY_LOG_FILE "/tmp/mongo_migration_test/my_debug.log"
+
+#define QEMU_PORT_DATA_LOW      0x1230
+#define QEMU_PORT_DATA_HIGH     0x1234
+#define QEMU_PORT_MONGO_EVICT   0x1240
+#define QEMU_PORT_MONGO_CMD     0x1241
 bool clearing_cache = false;
+pthread_t clearing_thread_id;
 /* メタデータを格納するためのグローバルなリスト */
 CACHE_PAGE_INFO *metadata_list = NULL;
 size_t metadata_count = 0;
 size_t metadata_capacity = 0;
 int stable_count = 0;
+// 1ページ(4KB)に収まるサイズに調整 (4096 - 8バイト(count)) / 8 = 511
+#define BATCH_SIZE 510
+typedef struct {
+    uint64_t count;
+    uint64_t total_pages;
+    //uint64_t vaddr_list[BATCH_SIZE];
+    uint64_t gpa_list[BATCH_SIZE]; 
+} mongoDB_evict_List;
+
+
+// グローバル変数としてリストを確保（スタックオーバーフロー防止）
+// posix_memalignなどでページ境界に合わせるとより安全です
+static mongoDB_evict_List evict_list;
+static pthread_mutex_t qemu_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int __evict_clear_all_walks_and_saved_tree(WT_SESSION_IMPL *);
 static void __evict_list_clear_page_locked(WT_SESSION_IMPL *, WT_REF *, bool);
@@ -37,6 +63,9 @@ uint32_t my_count_all_keys_in_page(WT_REF *ref);
 void __my_dump_all_keys_before_evict(WT_SESSION_IMPL *session, WT_REF *ref);
 static const char *ref_state_to_string(WT_REF_STATE state);
 void write_metadata(const char *dbname);
+static void my_log(const char *format, ...);
+static uintptr_t GVA_to_GPA(void *vaddr);
+static void add_mongoDB_evict_List(uintptr_t GVA, uintptr_t GPA);
 
 #include <stdlib.h> // malloc, realloc, free を使うために必要
 
@@ -2737,6 +2766,15 @@ __evict_get_ref(WT_SESSION_IMPL *session, bool is_server, WT_BTREE **btreep, WT_
       (is_app && F_ISSET(evict, WT_EVICT_CACHE_DIRTY_HARD));
     urgent_queue = evict->evict_urgent_queue;
 
+    if (clearing_cache == true) {
+        // もし current と other が同じキューを指していたらバグなので直す
+        if (evict->evict_current_queue == evict->evict_other_queue) {
+            my_log("WARNING: Queue pointers aliased! Fixing...\n");
+            // 強制的に [0] と [1] に割り振り直す
+            evict->evict_current_queue = &evict->evict_queues[0];
+            evict->evict_other_queue   = &evict->evict_queues[1];
+        }
+    }
     /* Avoid the LRU lock if no pages are available. */
     if (__evict_queue_empty(evict->evict_current_queue, is_server) &&
       __evict_queue_empty(evict->evict_other_queue, is_server) &&
@@ -2827,6 +2865,19 @@ __evict_get_ref(WT_SESSION_IMPL *session, bool is_server, WT_BTREE **btreep, WT_
     for (;;) {
         /* Verify there are still pages available. */
         if (__evict_queue_empty(queue, is_server && queue != urgent_queue)) {
+            if (clearing_cache == true) {
+                // どのキューが空判定されたのかもわかるようにしておくと便利です
+                const char *target_q_name = "Unknown";
+                if (queue == evict->evict_current_queue) target_q_name = "Current";
+                else if (queue == evict->evict_other_queue) target_q_name = "Other";
+                else if (queue == evict->evict_urgent_queue) target_q_name = "Urgent";
+
+                my_log("[__evict_get_ref:EMPTY] Target: %s | Current: %u, Other: %u, Urgent: %u\n",
+                       target_q_name,
+                       evict->evict_current_queue ? evict->evict_current_queue->evict_entries : 0,
+                       evict->evict_other_queue ? evict->evict_other_queue->evict_entries : 0,
+                       evict->evict_urgent_queue ? evict->evict_urgent_queue->evict_entries : 0);
+            }
             WT_STAT_CONN_INCR(session, eviction_get_ref_empty2);
             return (WT_NOTFOUND);
         }
@@ -2846,6 +2897,28 @@ __evict_get_ref(WT_SESSION_IMPL *session, bool is_server, WT_BTREE **btreep, WT_
         candidates /= 2;
 
     if(clearing_cache == true) candidates = __wt_cache_pages_inuse(conn->cache);
+
+    if (clearing_cache == true) {
+        // 現在のキューが「メイン」か「その他」か「緊急」かを判定（アドレス比較）
+        const char *q_name = "UNKNOWN";
+        if (queue == evict->evict_fill_queue) q_name = "FILL_QUEUE";
+        else if (queue == evict->evict_current_queue) q_name = "CURRENT_QUEUE";
+        else if (queue == evict->evict_other_queue) q_name = "OTHER_QUEUE";
+        else if (queue == evict->evict_urgent_queue) q_name = "URGENT_QUEUE";
+
+        // 現在の処理位置（インデックス）を計算
+        long current_idx = -1;
+        if (queue->evict_current >= queue->evict_queue) {
+            current_idx = queue->evict_current - queue->evict_queue;
+        }
+
+        my_log("[__evict_get_ref] Queue: %s (%p), Entries: %u, Candidates: %u (Local limit: %u), Start Index: %ld\n",
+               q_name, (void *)queue, 
+               queue->evict_entries, 
+               queue->evict_candidates, 
+               candidates,
+               current_idx);
+    }
 
     /* Get the next page queued for eviction. */
     for (evict_entry = queue->evict_current;
@@ -2932,7 +3005,17 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
     //1ページだけのクリア＆再構成のためのコード追加
     //if (clearing_cache == true && metadata_count != 0) return 0;
 
-    WT_RET_TRACK(__evict_get_ref(session, is_server, &btree, &ref, &previous_state));
+    //WT_RET_TRACK(__evict_get_ref(session, is_server, &btree, &ref, &previous_state));
+// 呼び出し実行
+    int get_ref_ret = __evict_get_ref(session, is_server, &btree, &ref, &previous_state);
+
+    // ★ログ追加: 結果確認
+    if (get_ref_ret != 0) {
+        my_log("__evict_get_ref failed with code: %d (Skipping eviction)\n", get_ref_ret);
+        return (get_ref_ret); // エラーならここで帰る（WT_RET_TRACK相当）
+    }
+
+    WT_RET_TRACK(get_ref_ret);
     WT_ASSERT(session, WT_REF_GET_STATE(ref) == WT_REF_LOCKED);
 
     time_start = 0;
@@ -2968,14 +3051,34 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
 
     // クリアしたページをmetadatalistに保存する
     // ▼▼▼ ステップ1: 退避「前」にメタデータを一時バッファに保存 ▼▼▼
-    if (clearing_cache == true) {
+    if (clearing_cache == true && pthread_equal(pthread_self(), clearing_thread_id)) {
+        if (__wt_ref_is_root(ref) || F_ISSET(ref, WT_REF_FLAG_INTERNAL)) {
+            my_log("[SKIP] Ignoring Internal/Root page: %p", ref);
+            ret = 0; // 正常終了として扱う
+        } else 
+        {
         // 既存の出力・保存関数を呼び出して、バッファにメタデータを保存
         save_page_info_to_buffer(btree, ref, &page_info_buffer);
+        // QEMUへの通知
+        uintptr_t GVA = (uintptr_t)ref->page; // 仮想アドレス
+        uintptr_t GPA = GVA_to_GPA(ref->page); // 物理アドレス
         // 2. ページの退避を試行
+        /*
+        if (ref == NULL) {
+            my_log("[PRE-EVICT CRITICAL] ref is NULL!");
+        } else if (ref->page == NULL) {
+            my_log("[PRE-EVICT CRITICAL] ref exists (%p) but page is NULL!", (void *)ref);
+        } else {
+        // 正常ケース: アドレスを出力
+            my_log("[PRE-EVICT] Ready to evict. ref=%p, page=%p", (void *)ref, (void *)ref->page);
+        }
+        my_log("\n");
+        */
+
         print_clear_page_info(session, "BEFORE", btree, ref, 0);
         WT_WITH_BTREE(session, btree, ret = __wt_evict(session, ref, previous_state, 0));
         print_clear_page_info(session, "AFTER", btree, ref, 1);
-        printf("\n");
+        my_log("\n");
 
         // ▼▼▼ ステップ2: 結果を確認し、成功した場合のみグローバルリストに保存 ▼▼▼
         // 退避が成功し、かつ状態がDISKになった場合のみ保存
@@ -2993,12 +3096,14 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
                 metadata_list[metadata_count] = page_info_buffer;
                 metadata_count++;
             }
+            add_mongoDB_evict_List(GVA, GPA);
         } else {
             // 失敗した場合は、理由を出力して何もしない
             if (WT_REF_GET_STATE(ref) == WT_REF_SPLIT)
                 printf(" -> Page was SPLIT. Metadata NOT saved.\n");
             else
                 printf(" -> Eviction FAILED with code %d. Metadata NOT saved.\n", ret);
+        }
         }
     }
     else
@@ -3825,11 +3930,13 @@ int __my_evict_walk_tree(WT_SESSION_IMPL *session, WTI_EVICT_QUEUE *queue, u_int
             __evict_clear_walk(session, false);
     }
     */
-    /*********************************************************/
-    /* ▼▼▼ MODIFICATION: 最後に掴んだページを確実に解放する ▼▼▼ */
-    /*********************************************************/
+    /*
+     * ref が NULL でない場合、ウォークが途中で終わってページを掴んだままの状態です。
+     * これを解放する必要がありますが、必ず「自分のセッション」を使います。
+     */
     if (ref != NULL) {
-        WT_TRET(__wt_page_release(evict->walk_session, ref, walk_flags));
+        // ★修正: evict->walk_session ではなく session を使う！
+        WT_TRET(__wt_page_release(session, ref, walk_flags));
         ref = NULL;
     }
 
@@ -3887,6 +3994,99 @@ my_evict_cmp(const void *a_arg, const void *b_arg)
     return (0);
 }
 
+// 引数に int stable_count を追加
+static void
+__filter_single_queue(WTI_EVICT_QUEUE *q)
+{
+    if (q->evict_entries == 0) return;
+
+    uint32_t write_idx = 0;
+    uint32_t original_entries = q->evict_entries;
+    uint32_t dropped_count = 0; // 削除数カウンタ
+
+    for (uint32_t read_idx = 0; read_idx < original_entries; read_idx++) {
+        WT_REF *ref = q->evict_queue[read_idx].ref;
+        bool keep = true;
+        const char *drop_reason = ""; // 削除理由
+
+        if (ref == NULL) {
+            keep = false;
+            drop_reason = "NULL_REF";
+        } else if (ref->page == NULL) {
+            keep = false;
+            drop_reason = "NO_PAGE_IN_MEMORY";
+        } else {
+            // 1. 内部ノードは除外
+            if (__wt_ref_is_root(ref)) {
+                 keep = false;
+                 drop_reason = "ROOT_PAGE";
+            } else if (F_ISSET(ref, WT_REF_FLAG_INTERNAL)) {
+                 keep = false;
+                 drop_reason = "INTERNAL_PAGE";
+            }
+            
+            // 2. 停滞時の強制削除（先頭のみ）
+            if (keep && stable_count >= 5 && read_idx == 0) {
+                keep = false;
+                drop_reason = "STAGNATION_FORCE_DROP (Head)";
+            }
+        }
+
+        if (!keep) {
+            // ▼▼▼ 追加: 削除ログ ▼▼▼
+            // ※ RefがNULLでない場合のみアドレス等を表示
+            if (ref != NULL) {
+                // ファイル名が取れるなら表示したいところですが、安全のためアドレスと理由のみ
+                my_log("[Filter] Dropping [%u]: Ref=%p, Reason=%s\n", 
+                       read_idx, (void *)ref, drop_reason);
+            } else {
+                my_log("[Filter] Dropping [%u]: Ref=NULL, Reason=%s\n", 
+                       read_idx, drop_reason);
+            }
+            dropped_count++;
+            // ▲▲▲ 追加終了 ▲▲▲
+        }
+
+        if (keep) {
+            if (read_idx != write_idx) {
+                q->evict_queue[write_idx] = q->evict_queue[read_idx];
+            }
+            write_idx++;
+        }
+    }
+
+    // ▼▼▼ 追加: まとめのログ（削除があった場合のみ） ▼▼▼
+    if (dropped_count > 0) {
+        my_log("[Filter] Summary: %u pages dropped, %u pages kept.\n", 
+               dropped_count, write_idx);
+    }
+
+    // --- 以下、既存の処理 ---
+
+    // 残りの領域をNULLクリア
+    for (uint32_t i = write_idx; i < original_entries; i++) {
+        q->evict_queue[i].ref = NULL;
+    }
+
+    q->evict_entries = write_idx;
+
+    if (q->evict_entries > 0) {
+        q->evict_current = q->evict_queue;
+    } else {
+        q->evict_current = NULL;
+    }
+
+    // 安全対策: NULLチェックと切り詰め
+    for (uint32_t i = 0; i < q->evict_entries; i++) {
+        if (q->evict_queue[i].ref == NULL) {
+            my_log("[Filter] WARNING: NULL found after compaction at index %u. Truncating.\n", i);
+            q->evict_entries = i; 
+            if (i == 0) q->evict_current = NULL;
+            break;
+        }
+    }
+}
+
 /*
  * __my_evict_lru_walk --
  * A modified version of __evict_lru_walk that calls __my_evict_walk
@@ -3906,7 +4106,6 @@ __my_evict_lru_walk(WT_SESSION_IMPL *session)
     conn = S2C(session);
     evict = conn->evict;
 
-    //今回ページを充填するqueueを決定。もし片方が一杯なら、もう片方を使う
     if (evict->evict_empty_score > 0)
         --evict->evict_empty_score;
 
@@ -3917,13 +4116,6 @@ __my_evict_lru_walk(WT_SESSION_IMPL *session)
     if (__evict_queue_full(queue) && !__evict_queue_full(other_queue))
         queue = other_queue;
 
-    /*
-    if (__evict_queue_full(queue) && evict->evict_empty_score < WT_EVICT_SCORE_CUTOFF) {
-        WT_STAT_CONN_INCR(session, eviction_queue_not_empty);
-        goto err;
-    }
-    */
-
     if (__evict_queue_empty(queue, false)) {
         if (F_ISSET(evict, WT_EVICT_CACHE_HARD))
             evict->evict_empty_score =
@@ -3932,34 +4124,10 @@ __my_evict_lru_walk(WT_SESSION_IMPL *session)
     } else
         WT_STAT_CONN_INCR(session, eviction_queue_not_empty);
     
-    //__my_evict_walkを呼ぶように修正
     if ((ret = __evict_walk(evict->walk_session, queue)) == EBUSY)
         ret = 0;
 
     WT_ERR_NOTFOUND_OK(ret, false);
-
-    //退避キューの中身を全て表示する
-    /*
-    if(stable_count > 1 ){
-        printf("stable_count = %d\n",stable_count);
-        printf("///// queue (__my_evict_lru_walk)/////\n");
-        __my_dump_eviction_queue(queue);
-        printf("///// other_queue (__my_evict_lru_walk)/////\n");
-        __my_dump_eviction_queue(other_queue);
-        printf("///// ??other_queue?? (__my_evict_lru_walk)/////\n");
-        __my_dump_eviction_queue(evict->evict_queues + (1 - (queue - evict->evict_queues)));
-
-    }
-    */
-   /*
-    if (ret == 0){
-        printf("DEBUG: __my_evict_lru_walk finished. Found %u pages. Queue is now populated.\n",queue->evict_entries);
-        if(queue->evict_entries < 20 ){
-            //printf("///// queue (__my_evict_lru_walk)/////\n");
-            //__my_dump_eviction_queue(queue);
-        }
-    }
-    */
 
     __wt_spin_lock(session, &queue->evict_lock);
 
@@ -3968,56 +4136,46 @@ __my_evict_lru_walk(WT_SESSION_IMPL *session)
     
     entries = queue->evict_entries;
 
-    // ▼▼▼ ソート処理を自作の比較関数で復活させる ▼▼▼
     __wt_qsort(queue->evict_queue, entries, sizeof(WTI_EVICT_ENTRY), my_evict_cmp);
 
-    /*
-     * Style note: __wt_qsort is a macro that can leave a dangling else. Full curly braces are
-     * needed here for the compiler.
-     */
-    /*    
-    if (FLD_ISSET(conn->debug_flags, WT_CONN_DEBUG_EVICT_AGGRESSIVE_MODE)) {
-        __wt_qsort(queue->evict_queue, entries, sizeof(WTI_EVICT_ENTRY), __evict_lru_cmp_debug);
-    } else {
-        __wt_qsort(queue->evict_queue, entries, sizeof(WTI_EVICT_ENTRY), __evict_lru_cmp);
-    }
-    */
-
-    //候補リストの後始末をする。空のエントリを削除したり、リストのサイズを調整したりする。
-    /* Trim empty entries from the end. */
     while (entries > 0 && queue->evict_queue[entries - 1].ref == NULL)
         --entries;
 
-    /*
-     * If we have more entries than the maximum tracked between walks, clear them. Do this before
-     * figuring out how many of the entries are candidates so we never end up with more candidates
-     * than entries.
-     */
-    /*
-    while (entries > WTI_EVICT_WALK_BASE)
-        __evict_list_clear(session, &queue->evict_queue[--entries]);
-        */
-       
+
+    // 1. 今回充填したメインキューを掃除
+    __filter_single_queue(queue);
+
     queue->evict_entries = entries;
 
+    // ★安全対策: 最終チェック (万が一NULLがあればそこで打ち切る)
+    for (uint32_t i = 0; i < entries; i++) {
+        if (queue->evict_queue[i].ref == NULL) {
+            // ログ関数が使えるなら警告を出す
+            // my_log("WARNING: NULL ref found after compaction at index %u\n", i);
+            entries = i;
+            queue->evict_entries = entries;
+            break;
+        }
+    }
+
+    my_log("Eviction LRU walk found %u candidates(stable_count=%d)\n", queue->evict_candidates, stable_count);
+    my_log("Other queue found %u candidates(stable_count=%d)\n", other_queue->evict_candidates, stable_count);
+
+    // 候補がない場合はエラーではなく WT_NOTFOUND を返して呼び出し元に知らせる
     if (entries == 0) {
         queue->evict_candidates = 0;
         queue->evict_current = NULL;
         __wt_spin_unlock(session, &queue->evict_lock);
+        ret = WT_NOTFOUND; 
         goto err;
     }
 
-    //見つかったページ(entries)の全てを最終的な退避候補(evict_candidates)として設定
     queue->evict_candidates = entries;
 
-    //キューのポインタを準備 & 待機中のワーカースレッドに通知
     WT_STAT_CONN_INCRV(session, eviction_pages_queued_post_lru, queue->evict_candidates);
     queue->evict_current = queue->evict_queue;
     __wt_spin_unlock(session, &queue->evict_lock);
 
-    /*
-     * Signal any application or helper threads that may be waiting to help with eviction.
-     */
     __wt_cond_signal(session, conn->evict_threads.wait_cond);
 
 err:
@@ -4073,18 +4231,18 @@ void print_clear_page_info(WT_SESSION_IMPL *session, const char *title, WT_BTREE
 //void print_clear_page_info(const char *title, WT_BTREE *btree, WT_REF *ref, int is_before)
 {
     // 1. まず、これまで通りデバッグ情報を画面に出力する
-    printf("・%s --\t", title);
+    my_log("・%s --\t", title);
     if(is_before != 1){
-        printf("・Page Ref Addr: %p\t", (void *)ref);
+        my_log("・Page Ref Addr: %p\t", (void *)ref);
         //printf("  -> Page Ptr      : %p\n", (void *)ref->page);
-        printf("・Page URI: %s\t", btree->dhandle->name);
+        my_log("・Page URI: %s\t", btree->dhandle->name);
     }
-    //printf("・Page Type: %s\t", __wt_ref_is_root(ref) ? "ROOT" : (F_ISSET(ref, WT_REF_FLAG_INTERNAL) ? "INTERNAL" : "LEAF"));
+    my_log("・Pagce Type: %s\t", __wt_ref_is_root(ref) ? "ROOT" : (F_ISSET(ref, WT_REF_FLAG_INTERNAL) ? "INTERNAL" : "LEAF"));
     //printf("  -> Page State   : %s\n", __wt_page_is_modified(ref->page) ? "DIRTY" : "CLEAN");
     //printf("・Ref State: %s (%d)\t", ref_state_to_string(WT_REF_GET_STATE(ref)), WT_REF_GET_STATE(ref));
     if (is_before != 1) {
         WT_PAGE *page = ref->page;
-        printf("・Page Size: %zu bytes\t", __wt_atomic_loadsize(&page->memory_footprint));
+        my_log("・Page Size: %zu bytes\t", __wt_atomic_loadsize(&page->memory_footprint));
 
         if (is_before == 0 && ref->key.ikey != NULL) {
             WT_IKEY *ikey_ptr = (WT_IKEY *)ref->key.ikey;
@@ -4424,6 +4582,295 @@ __my_dump_all_keys_before_evict(WT_SESSION_IMPL *session, WT_REF *ref)
     printf("--- Total Keys Found: %u ---\n\n", key_count);
 }
 
+static void my_log(const char *format, ...) {
+    // 追記モード(a)で開く
+    FILE *fp = fopen(MY_LOG_FILE, "a");
+    if (fp == NULL) return; // 開けなければ諦める（クラッシュさせない）
+    // タグを付ける
+    //fprintf(fp, "[MYDEBUG] ");
+
+    // 引数のフォーマット出力
+    va_list args;
+    va_start(args, format);
+    vfprintf(fp, format, args);
+    va_end(args);
+
+    fflush(fp);
+    fclose(fp);
+}
+
+// GPA正当性検証用関数
+static void log_page_content(void *vaddr, uintptr_t gpa) {
+    unsigned char *p = (unsigned char *)vaddr;    
+    my_log("VAddr: %p maps to GPA: 0x%lx\n", vaddr, gpa);
+    
+    // 先頭 48バイト を16進数でダンプ
+    my_log("%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+           p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+    my_log("%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+           p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23], p[24], p[25], p[26], p[27], p[28], p[29], p[30], p[31]);
+    my_log("%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+           p[32], p[33], p[34], p[35], p[36], p[37], p[38], p[39], p[40], p[41], p[42], p[43], p[44], p[45], p[46], p[47]);
+
+    my_log("--------------------------\n");
+}
+
+// 仮想アドレス(User VA) -> 物理アドレス(GPA) 変換
+// /proc/self/pagemap を使用 (要root権限)
+static uintptr_t GVA_to_GPA(void *vaddr) {
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) {
+        // エラーログを毎回出すと重いので省略、または頻度制限
+        return 0;
+    }
+
+    uint64_t vaddr_val = (uintptr_t)vaddr;
+    uint64_t pfn_item_offset = (vaddr_val / 4096) * 8;
+    uint64_t pfn_item = 0;
+
+    if (pread(fd, &pfn_item, 8, pfn_item_offset) != 8) {
+        close(fd);
+        return 0;
+    }
+    close(fd);
+
+    if ((pfn_item & (1ULL << 63)) == 0) {
+        return 0; 
+    }
+    // --- ここで生の値をチェック ---
+    uint64_t pfn = pfn_item & ((1ULL << 55) - 1);
+
+    //my_log("VAddr: %p -> RawItem: 0x%016lx | Present: %d | PFN: 0x%lx\n", vaddr, pfn_item, present, pfn);
+    //my_log("VAddr: %p -> GPA: 0x%lx\n", vaddr, (pfn * 4096) + (vaddr_val % 4096));
+
+    return (pfn * 4096) + (vaddr_val % 4096);
+}
+
+// QEMUにリストを送信する関数
+static void notify_qemu_eviction() {
+    // カウント0ならロックする前に帰る
+    if (evict_list.count == 0) return;
+
+    // 1. 物理アドレス変換 (ロックの外で行う方が効率が良い)
+    uintptr_t list_phys_addr = GVA_to_GPA(&evict_list);
+    
+    // 変換失敗なら終了
+    if (list_phys_addr == 0) {
+        fprintf(stderr, "WiredTiger Error: Failed to get physical address of eviction list.\n");
+        return;
+    }
+
+    // 2. 権限チェック
+    if (iopl(3) < 0) {
+        static int iopl_error_printed = 0;
+        if (!iopl_error_printed) {
+            fprintf(stderr, "WiredTiger Error: iopl(3) failed: %s. (Need sudo?)\n", strerror(errno));
+            iopl_error_printed = 1;
+        }
+        return;
+    }
+
+    // 3. ロック取得 (ここからクリティカルセクション)
+    pthread_mutex_lock(&qemu_lock);
+
+    // ロック取得後、念のため再度カウントチェック (他のスレッドが既に送ったかもしれない)
+    if (evict_list.count == 0) {
+        pthread_mutex_unlock(&qemu_lock);
+        return;
+    }
+
+    // メモリバリア
+    __asm__ __volatile__("mfence" ::: "memory");
+
+    
+    // 送信
+    outl((uint32_t)(list_phys_addr & 0xFFFFFFFF), QEMU_PORT_DATA_LOW);
+    outl((uint32_t)(list_phys_addr >> 32), QEMU_PORT_DATA_HIGH);
+    
+    my_log("WiredTiger: Sent eviction list at GPA 0x%lx with %zu entries to QEMU.(thread %lu)\n", 
+        list_phys_addr, evict_list.count, pthread_self());
+
+    // トリガー
+    outl(1, QEMU_PORT_MONGO_EVICT);
+
+    // リセット
+    evict_list.count = 0;
+
+    // 4. ロック解除 (必須！！)
+    pthread_mutex_unlock(&qemu_lock);
+}
+
+/* QEMUスキップリストへの追加を行う専用関数 */
+static void 
+add_mongoDB_evict_List(uintptr_t GVA, uintptr_t GPA) 
+{
+
+    if (!pthread_equal(pthread_self(), clearing_thread_id)) {
+        return;
+    }
+    if (GPA != 0) {
+        // グローバルリストに追加
+        //evict_list.vaddr_list[evict_list.count] = (uint64_t)GVA;
+        evict_list.gpa_list[evict_list.count++] = (uint64_t)GPA;
+        evict_list.total_pages++;
+        
+        // バッファがいっぱいなら送信
+        if (evict_list.count >= BATCH_SIZE) {
+            notify_qemu_eviction();
+        }
+
+        // 1ページクリア用のコード：リスト１つずつ送る
+        /*
+        if (evict_list.count > -1) {
+            // デバッグログ出力
+            unsigned char *p = (unsigned char *)ref->page; 
+            my_log("[MONGO DATA] VAddr: %p, GPA: 0x%lx, Data: %02X %02X %02X %02X ...", 
+                p, phys_addr, p[0], p[1], p[2], p[3]);
+            notify_qemu_eviction();
+        }
+        */
+    }
+}
+/* QEMUスキップリストへの追加を行う専用関数 */
+/*
+static void 
+add_mongoDB_evict_List(WT_REF *ref) 
+{
+    if (ref == NULL || ref->page == NULL) return;
+
+    // ページ構造体の物理アドレスを取得
+    uintptr_t phys_addr = GVA_to_GPA(ref->page);
+
+
+    if (phys_addr != 0) {
+        // 検証関数の呼び出し
+        if (evict_list.count < 5) { 
+            log_page_content(ref->page, phys_addr);
+        }
+
+        // グローバルリストに追加
+        evict_list.vaddr_list[evict_list.count] = (uint64_t)ref->page;
+        evict_list.gpa_list[evict_list.count++] = (uint64_t)phys_addr;
+        evict_list.total_pages++;
+        
+        // バッファがいっぱいなら送信
+        if (evict_list.count >= BATCH_SIZE) {
+            notify_qemu_eviction();
+        }
+    }
+}
+*/
+
+// QEMUからの指令を待つスレッド
+static void* qemu_monitor_thread(void *arg) {
+    WT_CONNECTION *conn = (WT_CONNECTION *)arg;
+    
+    my_log("[MONITOR] QEMU Monitor Thread Started.\n");
+
+    // ルート権限チェック (iopl用)
+    if (iopl(3) < 0) {
+        my_log("[MONITOR ERROR] iopl failed. Cannot monitor QEMU.\n");
+        return NULL;
+    }
+
+    while (true) {
+        // 1. ポートを読んでフラグチェック
+        // inl: 32bit read (QEMU側の size=4 に合わせる)
+        uint32_t flag = inl(QEMU_PORT_MONGO_CMD);
+        //my_log("[MONITOR] Checked QEMU port, flag=%u\n", flag);
+        if (flag == 1) {
+            my_log("[MONITOR] QEMU migration signal detected! Executing wt_clear_cache...");
+            // 2. 「了解した」とQEMUに伝える（フラグを0に戻させる）
+            outl(0, QEMU_PORT_MONGO_CMD);
+            // これをやらないと、このループ内で何度も実行されてしまう
+            // 3. キャッシュクリア実行
+            wt_clear_cache(conn);
+            outl(2, QEMU_PORT_MONGO_CMD);
+            my_log("[MONITOR] Cache Clear Finished. Resuming monitoring.");
+        }
+        // CPUを使いすぎないように少し寝る (1000ms)
+        usleep(10000000); 
+    }
+    return NULL;
+}
+
+// static変数で多重起動を防止
+static int monitor_thread_started = 0;
+
+void start_qemu_monitor(WT_CONNECTION *conn) {
+    // 既に起動済みなら何もしない
+    if (monitor_thread_started) {
+        my_log("[MONITOR] Thread already running. Skipping.");
+        return;
+    }
+    
+    monitor_thread_started = 1; // フラグを立てる
+
+    pthread_t thread_id;
+    int ret = pthread_create(&thread_id, NULL, qemu_monitor_thread, (void*)conn);
+    if (ret != 0) {
+        my_log("[MONITOR ERROR] Failed to create thread: %d", ret);
+        monitor_thread_started = 0; // 失敗したらフラグを戻す
+    } else {
+        pthread_detach(thread_id);
+        my_log("[MONITOR] Monitor thread launched successfully.");
+    }
+}
+
+/*
+void start_qemu_monitor(WT_CONNECTION *conn) {
+    pthread_t thread_id;
+    // スレッド作成
+    int ret = pthread_create(&thread_id, NULL, qemu_monitor_thread, (void*)conn);
+    if (ret == 0) {
+        // デタッチ（メインスレッド終了時に道連れで終了させるため）
+        pthread_detach(thread_id);
+    } else {
+        my_log("[MONITOR ERROR] Failed to create thread: %d", ret);
+    }
+}
+*/
+void
+dump_evict_queue_list(WT_CONNECTION_IMPL *conn){
+    WT_EVICT *evict = conn->evict;
+my_log("=== Final Eviction Queue Dump ===\n");
+
+    // 現在のfill_queueと、もう片方のキューを取得
+    WTI_EVICT_QUEUE *q_list[2];
+    q_list[0] = evict->evict_fill_queue;
+    q_list[1] = evict->evict_queues + (1 - (q_list[0] - evict->evict_queues));
+
+    const char *q_names[] = {"Fill Queue", "Other Queue"};
+
+    for (int q_idx = 0; q_idx < 2; q_idx++) {
+        WTI_EVICT_QUEUE *q = q_list[q_idx];
+        my_log("--- %s (entries: %u) ---\n", q_names[q_idx], q->evict_entries);
+
+        for (uint32_t i = 0; i < q->evict_entries; i++) {
+            WT_REF *r = q->evict_queue[i].ref;
+            if (r == NULL) {
+                my_log("  [%u] NULL\n", i);
+                continue;
+            }
+
+            // ページタイプの判定
+            const char *type = "UNKNOWN";
+            if (__wt_ref_is_root(r)) {
+                type = "ROOT";
+            } else if (F_ISSET(r, WT_REF_FLAG_INTERNAL)) {
+                type = "INTERNAL";
+            } else {
+                type = "LEAF"; // 通常はこれが退避対象
+            }
+
+            // ファイル名の取得について:
+            // WT_PAGE構造体にdhandleがない場合、安全にファイル名を取るのは難しいため
+            // 無理にアクセスせず、アドレスとタイプだけを表示するのが最もクラッシュしにくい方法です。
+            my_log("  [%u] Ref: %p, Type: %s\n", i, (void *)r, type);
+        }
+    }
+    my_log("=====================================\n");
+}
 
 /*
  * wt_clear_cache --
@@ -4433,64 +4880,95 @@ int
 wt_clear_cache(WT_CONNECTION *connection)
 {
     WT_CONNECTION_IMPL *conn_impl;
-    WT_SESSION_IMPL *session;
+    WT_SESSION_IMPL *session_impl;
+    WT_SESSION *session; // API呼び出し用の通常セッションポインタ
     WT_EVICT *evict; // evict構造体へのポインタを追加
-    WT_SESSION *app_session; // API呼び出し用の通常セッションポインタ
     int ret = 0, tret;
     uint64_t current_size, prev_size = UINT64_MAX;
 
+    my_log("start wt_clear_cache\n");
 
     conn_impl = (WT_CONNECTION_IMPL *)connection;
+    if (conn_impl == NULL) {
+        my_log("Error: connection is NULL\n");
+    }
     evict = conn_impl->evict; // evict構造体を取得
+    if (evict == NULL) {
+        my_log("Error: eviction server is not running or not initialized (evict is NULL)\n");
+        // Evictionサーバーが動いていないならキャッシュクリア処理もできないため、エラーで戻る
+    }
 
-    if ((ret = __wt_open_session(conn_impl, NULL, NULL, false, &session)) != 0)
+    if ((ret = __wt_open_session(conn_impl, NULL, NULL, false, &session_impl)) != 0)
         return (ret);
     
-    app_session = (WT_SESSION *)session;
-    F_SET(session, WT_SESSION_EVICTION);
+    session = (WT_SESSION *)session_impl;
+    F_SET(session_impl, WT_SESSION_EVICTION);
     /* ▼▼▼ ステップ1: チェックポイントでダーティページを全てクリーンにする ▼▼▼ */
-    if ((ret = app_session->checkpoint(app_session, NULL)) != 0) {
+    if ((ret = session->checkpoint(session, NULL)) != 0) {
         fprintf(stderr, "Checkpoint failed: %s\n", wiredtiger_strerror(ret));
-        tret = __wt_session_close_internal(session); // エラーでもセッションは閉じる
+        tret = __wt_session_close_internal(session_impl); // エラーでもセッションは閉じる
         (void)tret;
         return (ret);
     }
-
-    printf("\n=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= Dumping initiate in cache ");
-    connection->debug_info(connection, "cache");
-    printf("\n=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n");
-    //wt_collect_page_refs(connection);
-    //wt_dump_pages_from_refs(connection);
-
-    __wt_spin_lock(session, &evict->evict_pass_lock);
+    // バックグラウンドのチェックポイント処理と競合してクラッシュするのを防ぎます
+    __wt_spin_lock(session_impl, &conn_impl->checkpoint_lock);
+    // 2. ハンドル操作(Sweep/Open/Close)を止める
+    //__wt_writelock(session_impl, &conn_impl->dhandle_lock);
+    // Evictionロックの取得
+    __wt_spin_lock(session_impl, &evict->evict_pass_lock);
     
     clearing_cache = true;
     current_size = __wt_cache_pages_inuse(conn_impl->cache);
-
+    
     wt_pause_eviction_server(connection);
+    // 現在のスレッドIDを記録
+    clearing_thread_id = pthread_self();
+    // リストの初期化
+    evict_list.count = 0;
 
     while (stable_count < 10) { // 10回連続でサイズが変わらなければ完了とみなす
+        /*
         if((stable_count != 0) && (stable_count % 10) == 0){
             printf("...Recheckpoint...\n");
-            __wt_spin_unlock(session, &evict->evict_pass_lock);
-            if((ret = app_session->checkpoint(app_session, NULL)) != 0) {
+            __wt_spin_unlock(session_impl, &evict->evict_pass_lock);
+            if((ret = session->checkpoint(session, NULL)) != 0) {
                 fprintf(stderr, "Checkpoint failed: %s\n", wiredtiger_strerror(ret));
-                tret = __wt_session_close_internal(session); // エラーでもセッションは閉じる
+                tret = __wt_session_close_internal(session_impl); // エラーでもセッションは閉じる
                 (void)tret;
                 return (ret);
             }
-            __wt_spin_lock(session, &evict->evict_pass_lock);
+            __wt_spin_lock(session_impl, &evict->evict_pass_lock);
         }
+        */
         prev_size = __wt_cache_pages_inuse(conn_impl->cache);
 
-        ret = __my_evict_lru_walk(session);
+        // 1. 補充: リスト作成とCompaction
+        int walk_ret = __my_evict_lru_walk(session_impl);
 
-        if (ret != 0) {
-            if (ret == WT_NOTFOUND) ret = 0; // NOTFOUNDはエラーではない
+        // 2. 在庫確認: 2つのキューのどちらかにデータがあるかチェック
+        // evict->evict_queues は配列なので、0番と1番を確認
+        uint32_t total_entries = 0;
+        WTI_EVICT_QUEUE *q_list[2];
+        q_list[0] = conn_impl->evict->evict_fill_queue;
+        q_list[1] = conn_impl->evict->evict_queues + (1 - (q_list[0] - conn_impl->evict->evict_queues));
+        total_entries += q_list[0]->evict_entries;
+        total_entries += q_list[1]->evict_entries;
+
+        // 3. 終了判定
+        // 「補充失敗(NOTFOUND)」かつ「在庫なし(0)」なら終了
+        if (walk_ret == WT_NOTFOUND && total_entries == 0) {
+            my_log("Eviction queues are completely empty. Cache clear complete.\n");
+            ret = 0;
             break;
         }
+        
+        // 4. 退避実行
+        // 在庫があるなら、walkの結果に関わらず退避を試みる
+        if (total_entries > 0) {
+            // my_log("Evicting... (Pending entries: %u)\n", total_entries);
+            if ((ret = __evict_lru_pages(session_impl, false)) != 0) break;
+        }
 
-        if ((ret = __evict_lru_pages(session, true)) != 0) break;
         current_size = __wt_cache_pages_inuse(conn_impl->cache);
         //printf("%d:  -> Page size: %" PRIu64 " pages\n", i++, current_size);
 
@@ -4499,20 +4977,33 @@ wt_clear_cache(WT_CONNECTION *connection)
         
         //1ページだけのクリア＆再構成のためのコード追加
         //if (metadata_count >= 1) break;
-        }
-        
-    printf("\n=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= Dumping after clearing pages in cache ");
-    connection->debug_info(connection, "cache");
-    printf("\n=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n");
+        }    
+    
     //wt_dump_pages_from_refs(connection);
 
-    wt_resume_eviction_server(connection);
+    //wt_resume_eviction_server(connection);
 
     clearing_cache = false;
+    clearing_thread_id = 0;
 
-    __wt_spin_unlock(session, &evict->evict_pass_lock);
+    /*
+    printf("total pagecount: %zu\n", evict_list.total_pages);
+    printf("metadata_count: %zu\n", metadata_count);
+    my_log("total pagecount: %zu\n", evict_list.total_pages);
+    my_log("metadata_count: %zu\n", metadata_count);
+    for(size_t i = 0; i < evict_list.count; i++) {
+        my_log("Evicted Page %zu: GPA: 0x%lx\n", i, (unsigned long)evict_list.gpa_list[i]);
+    }
+    */
+    if (evict_list.count > 0) {
+        notify_qemu_eviction();
+    }
 
-    if ((tret = __wt_session_close_internal(session)) != 0 && ret == 0) ret = tret;
+    __wt_spin_unlock(session_impl, &evict->evict_pass_lock);
+    //__wt_writeunlock(session_impl, &conn_impl->dhandle_lock);
+    __wt_spin_unlock(session_impl, &conn_impl->checkpoint_lock);
+
+    if ((tret = __wt_session_close_internal(session_impl)) != 0 && ret == 0) ret = tret;
 
     write_metadata(conn_impl->home);
     //重要：再構成が完了したら、グローバルリストが確保したメモリを解放し、カウンタをリセットして、次回の実行に備える。
@@ -4523,6 +5014,8 @@ wt_clear_cache(WT_CONNECTION *connection)
     }
     metadata_count = 0;
     */
+    outl(2, QEMU_PORT_MONGO_CMD);
 
+    dump_evict_queue_list(conn_impl);
     return (ret);
 }

@@ -1,40 +1,21 @@
 #!/bin/bash
-
-# ========================================================
-# MongoDB Custom Cache Verification Script
-# ========================================================
-
 set -e # エラーが発生したら即停止
 
-# --- Root権限チェック ---
-if [ "$EUID" -ne 0 ]; then
-  echo "❌ Error: This script must be run as root (sudo) for iopl/pagemap access."
-  exit 1
-fi
-
 # ==========================================
-# 1. 設定 (環境に合わせて変更してください)
+# 1. 設定
 # ==========================================
-BASE_DIR=$(dirname "$0")
-
-# ★ ビルドしたバイナリのパス
-MONGOD_BINARY="/home/mitsuki/mongo/bazel-bin/install-dist-test/bin/mongod"
-# VM上で実行する場合
-# MONGOD_BINARY="/home/mitsuki/mongod"
-
-# テスト用DBとログの場所
-DB_PATH="/tmp/mongo_single_session_test_$(date +%s)"
-LOG_PATH="$DB_PATH/mongod.log"
+# VS Codeの launch.json で設定しているポート番号と一致させること
 PORT=27017
 
 # テストデータの件数
-DOC_COUNT=10000
+DOC_COUNT=10
 
 echo "=================================================="
-echo "   MongoDB Custom Cache Verification (Single Session)   "
+echo "   MongoDB Debug Trigger (Client Operations Only)   "
 echo "=================================================="
-echo "DB Path: $DB_PATH"
-echo "Log Path: $LOG_PATH"
+echo "Target Port: $PORT"
+echo "Make sure mongod is running in VS Code debugger (F5)!"
+echo "--------------------------------------------------"
 
 # ==========================================
 # [関数] キャッシュ統計を表示するヘルパー
@@ -56,34 +37,25 @@ check_cache_stats() {
           print('  - Dirty Pages: ' + dirty);
       } catch(e) {
           print('Error getting stats: ' + e);
+          print('(Is mongod running?)');
+          quit(1);
       }
     "
     echo "------------------------------------------------"
 }
 
 # ==========================================
-# 2. 初期化と起動
+# 2. サーバー接続確認
 # ==========================================
-echo "--- [Step 0] 環境初期化 ---"
-rm -rf "$DB_PATH"
-mkdir -p "$DB_PATH"
-
-# C言語側(my_printf)用のログファイルを初期化
-# sudo で実行しているため、権限を777にして誰でも書き込めるようにする
-sudo rm -f /tmp/my_debug.log
-sudo touch /tmp/my_debug.log
-sudo chmod 777 /tmp/my_debug.log
-
-echo "--- [Step 1] Custom mongod を起動 ---"
-"$MONGOD_BINARY" --fork --dbpath "$DB_PATH" --logpath "$LOG_PATH" --port "$PORT" --bind_ip 127.0.0.1
-sleep 5
-
-# 起動確認
-if ! pgrep -f "mongod.*$PORT" > /dev/null; then
-    echo "❌ ERROR: mongod の起動に失敗しました。ログ: $LOG_PATH"
+echo "--- [Step 1] サーバー接続確認 ---"
+# mongodが起動しているかチェックする
+if ! mongosh --quiet --port "$PORT" --eval "db.runCommand({ping:1})" > /dev/null 2>&1; then
+    echo "❌ ERROR: Could not connect to mongod on port $PORT."
+    echo "   Please start mongod in VS Code debugger first!"
     exit 1
 fi
-echo "✅ mongod started (PID: $(pgrep -f "mongod.*$PORT"))"
+echo "✅ Connected to mongod."
+
 
 # ==========================================
 # 3. データ挿入 (キャッシュ温め)
@@ -100,7 +72,7 @@ mongosh --quiet --port "$PORT" --eval "
           key: 'key_' + i, 
           val: 'value_' + i,
           // キャッシュを消費させるためのパディング
-          pad: 'A'.repeat(2048) 
+          pad: 'x'.repeat(1024) 
       });
   }
   bulk.execute();
@@ -114,9 +86,12 @@ check_cache_stats "データ挿入直後 (High Cache Usage)"
 # 4. カスタムキャッシュクリア (wt_clear_cache)
 # ==========================================
 echo "--- [Step 3] カスタムキャッシュクリアの実行 (customClear) ---"
+echo "👉 VS Code でブレークポイントを設定している場合、ここで止まります！"
 
+# ★ここであなたの wt_clear_cache を呼び出すコマンドを実行
 mongosh --quiet --port "$PORT" --eval "
   print('Executing customClear command...');
+  
   const res = db.adminCommand({ customClear: 1 }); 
   printjson(res);
   
@@ -126,16 +101,22 @@ mongosh --quiet --port "$PORT" --eval "
   }
 "
 
+# 実行後の安定待ち
 sleep 2
+
+# 統計確認: クリア後 (サイズが減っていることを期待)
 check_cache_stats "キャッシュクリア後 (Low Cache Usage)"
 
 # ==========================================
 # 5. カスタムキャッシュ復元 (wt_reconstruct_cache)
 # ==========================================
 echo "--- [Step 4] カスタムキャッシュ復元の実行 (customReconstruct) ---"
+echo "👉 復元処理のデバッグをするなら、ここで止まります！"
 
+# ★ここであなたの wt_reconstruct_cache を呼び出すコマンドを実行
 mongosh --quiet --port "$PORT" --eval "
   print('Executing customReconstruct command...');
+  
   const res = db.adminCommand({ customReconstruct: 1 });
   printjson(res);
 
@@ -145,7 +126,10 @@ mongosh --quiet --port "$PORT" --eval "
   }
 "
 
+# 復元処理待ち
 sleep 5
+
+# 統計確認: 復元後 (サイズが増えていることを期待)
 check_cache_stats "キャッシュ復元後 (Restored Usage)"
 
 # ==========================================
@@ -159,7 +143,9 @@ mongosh --quiet --port "$PORT" --eval "
   
   print('Documents in DB: ' + count);
   
+  // 単純な件数チェック (必要に応じて中身のチェックを追加)
   if (count === $DOC_COUNT) {
+      // 特定のデータが存在するかチェック
       const sample = db.my_table.findOne({_id: 0});
       if(sample && sample.key === 'key_0') {
           print('✅ VALIDATION PASSED');
@@ -181,26 +167,11 @@ else
 fi
 
 # ==========================================
-# 7. ログ抽出 & クリーンアップ
+# 7. 終了（クリーンアップはしない）
 # ==========================================
-echo "--- [Step 6] ログ確認 & クリーンアップ ---"
-
-# ★★★ ここでカスタムログを表示 ★★★
-echo ""
-echo "🔍 Checking for [MYDEBUG] logs in /tmp/my_debug.log ..."
-if [ -f "/tmp/my_debug.log" ]; then
-    cat /tmp/my_debug.log
-else
-    echo "No custom log file found."
-fi
-echo ""
-
-# サーバー停止
-mongosh --quiet --port "$PORT" --eval "db.getSiblingDB('admin').shutdownServer()" 2>/dev/null || true
-sleep 3
-
-# ディレクトリ削除
-rm -rf "$DB_PATH"
+echo "--- [Step 6] テスト完了 ---"
+echo "デバッグ中のため、mongod はシャットダウンしません。"
+echo "VS Code の停止ボタン■ を押して終了してください。"
 
 echo "======================================"
 echo "TEST RESULT: $RESULT"

@@ -12,6 +12,8 @@
 #include <sys/io.h>
 #include <sys/mman.h> // mmap用
 #include <stdarg.h> // va_list用
+//#include <malloc.h> // malloc_trim用
+#include <dlfcn.h>
 
 #define MY_LOG_FILE "/tmp/mongo_migration_test/my_debug.log"
 
@@ -3011,7 +3013,7 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
 
     // ★ログ追加: 結果確認
     if (get_ref_ret != 0) {
-        my_log("__evict_get_ref failed with code: %d (Skipping eviction)\n", get_ref_ret);
+        //my_log("__evict_get_ref failed with code: %d (Skipping eviction)\n", get_ref_ret);
         return (get_ref_ret); // エラーならここで帰る（WT_RET_TRACK相当）
     }
 
@@ -3058,26 +3060,50 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
         } else 
         {
         // 既存の出力・保存関数を呼び出して、バッファにメタデータを保存
-        save_page_info_to_buffer(btree, ref, &page_info_buffer);
+        //復元のための関数であり、転送スキップのためには使わないから一時的にコメントアウトする
+        //save_page_info_to_buffer(btree, ref, &page_info_buffer);
         // QEMUへの通知
-        uintptr_t GVA = (uintptr_t)ref->page; // 仮想アドレス
-        uintptr_t GPA = GVA_to_GPA(ref->page); // 物理アドレス
-        // 2. ページの退避を試行
-        /*
-        if (ref == NULL) {
-            my_log("[PRE-EVICT CRITICAL] ref is NULL!");
-        } else if (ref->page == NULL) {
-            my_log("[PRE-EVICT CRITICAL] ref exists (%p) but page is NULL!", (void *)ref);
-        } else {
-        // 正常ケース: アドレスを出力
-            my_log("[PRE-EVICT] Ready to evict. ref=%p, page=%p", (void *)ref, (void *)ref->page);
-        }
-        my_log("\n");
-        */
+        //uintptr_t GVA = (uintptr_t)ref->page; // 仮想アドレス
+        //uintptr_t GPA = GVA_to_GPA(ref->page); // 物理アドレス
+        // ▼▼▼ 修正: 退避「前」に物理アドレスリスト(GPA)を計算して一時退避 ▼▼▼
+        // 最大 1MB (4KB * 256) 程度まで対応可能な一時バッファを用意
+        #define MAX_TEMP_GPAS 256
+        uint64_t temp_gpas[MAX_TEMP_GPAS];
+        uintptr_t temp_gvas[MAX_TEMP_GPAS];
+        int temp_gpa_count = 0;
 
-        print_clear_page_info(session, "BEFORE", btree, ref, 0);
+        if (ref->page->dsk != NULL) {
+            // ディスクイメージ（実データ）がある場合
+            uintptr_t start_addr = (uintptr_t)ref->page->dsk;
+            uint32_t size = ref->page->dsk->mem_size;
+
+            // 4KB刻みで物理アドレスを計算して配列に保存
+            for (uint32_t offset = 0; offset < size && temp_gpa_count < MAX_TEMP_GPAS; offset += 4096) {
+                void *curr_vaddr = (void *)(start_addr + offset);
+            
+                // ★重要: メモリがあるうちに変換する
+                uint64_t gpa = GVA_to_GPA(curr_vaddr);
+            
+                if (gpa != 0) {
+                    temp_gvas[temp_gpa_count] = (uintptr_t)curr_vaddr;
+                    temp_gpas[temp_gpa_count] = gpa;
+                    temp_gpa_count++;
+                }
+            }
+        } else {
+            // dskがない場合（念のためpage自体を登録）
+            uint64_t gpa = GVA_to_GPA(ref->page);
+            if (gpa != 0) {
+                temp_gvas[0] = (uintptr_t)ref->page;
+                temp_gpas[0] = gpa;
+                temp_gpa_count = 1;
+            }
+            my_log(" -> Warning: Page has no dsk image. Using page address only.\n");
+        }
+        // 2. ページの退避を試行
+        //print_clear_page_info(session, "BEFORE", btree, ref, 0);
         WT_WITH_BTREE(session, btree, ret = __wt_evict(session, ref, previous_state, 0));
-        print_clear_page_info(session, "AFTER", btree, ref, 1);
+        //print_clear_page_info(session, "AFTER", btree, ref, 1);
         my_log("\n");
 
         // ▼▼▼ ステップ2: 結果を確認し、成功した場合のみグローバルリストに保存 ▼▼▼
@@ -3096,7 +3122,12 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
                 metadata_list[metadata_count] = page_info_buffer;
                 metadata_count++;
             }
-            add_mongoDB_evict_List(GVA, GPA);
+            // 2. QEMUリストへの追加 (★一時配列からコピーするだけ)
+            for (int i = 0; i < temp_gpa_count; i++) {
+                //my_log(" -> Adding to evict list: GVA=0x%lx, GPA=0x%lx\n", temp_gvas[i], temp_gpas[i]);
+                add_mongoDB_evict_List(temp_gvas[i], temp_gpas[i]);
+            }            
+            //add_mongoDB_evict_List(GVA, GPA);
         } else {
             // 失敗した場合は、理由を出力して何もしない
             if (WT_REF_GET_STATE(ref) == WT_REF_SPLIT)
@@ -4198,14 +4229,19 @@ save_page_info_to_buffer(WT_BTREE *btree, WT_REF *ref, CACHE_PAGE_INFO *info)
     /* 子ページのキーをコピー (row-storeの場合) */
     if (ref->key.ikey != NULL) {
         WT_IKEY *ikey_ptr = (WT_IKEY *)ref->key.ikey;
-        info->child_key_size = ikey_ptr->size;
-        if(ikey_ptr->size != 1 )
-            memcpy(info->child_key, (uint8_t *)ikey_ptr + sizeof(size_t), info->child_key_size);
-        else {
-            sprintf((char *)info->child_key, "key%010d", 0);
-            info->child_key_size = strlen((const char *)info->child_key);
-            //char *zero_key = "key0000000000";
-            //memcpy(info->child_key, (uint8_t *)zero_key + sizeof(size_t), strlen(zero_key) + 1);
+        size_t key_len = ikey_ptr->size;
+        // info->child_key のサイズに合わせて調整してください (ここでは仮に256とします)
+        size_t max_len = sizeof(info->child_key) - 1; 
+
+        if (key_len > max_len) {
+            // キーが長すぎる場合は切り詰める
+            key_len = max_len;
+        }
+        info->child_key_size = key_len;
+
+        if(ikey_ptr->size != 1 ) {
+            memcpy(info->child_key, (uint8_t *)ikey_ptr + sizeof(size_t), key_len);
+            info->child_key[key_len] = '\0'; // NULL終端
         }
         info->page_size = __wt_atomic_loadsize(&ref->page->memory_footprint);
     } else {
@@ -5005,7 +5041,7 @@ wt_clear_cache(WT_CONNECTION *connection)
 
     if ((tret = __wt_session_close_internal(session_impl)) != 0 && ret == 0) ret = tret;
 
-    write_metadata(conn_impl->home);
+    //write_metadata(conn_impl->home);
     //重要：再構成が完了したら、グローバルリストが確保したメモリを解放し、カウンタをリセットして、次回の実行に備える。
     /*
     if (metadata_list != NULL) {

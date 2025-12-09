@@ -50,13 +50,15 @@
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
+//TCMalloc拡張機能
+#include "third_party/tcmalloc/dist/tcmalloc/malloc_extension.h"
 //#include "cache_clear_and_reconstruct.cpp"
 #include <fstream>
 #include <iostream>
 #include <wiredtiger.h>
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h" 
 #include "mongo/db/storage/wiredtiger/wiredtiger_connection.h"
-
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 #include <cstddef>
 #include <stack>
 #include <string>
@@ -371,6 +373,42 @@ public:
         // C関数呼び出し
         int ret = wt_clear_cache(conn);
         
+        // キャッシュクリア成功後にメモリを強制解放
+        // ▼▼▼ 修正: TCMalloc 統計をファイルに出力してメモリ解放 ▼▼▼
+        /*
+        if (ret == 0) {
+            // 出力先ファイルを開く (追記モード)
+            std::ofstream logFile("/tmp/mongo_migration_test/tcmalloc_stats.log", std::ios::app);
+            
+            if (logFile.is_open()) {
+                logFile << "=== [CustomClear] Start Memory Release ===" << std::endl;
+
+                // 1. 解放前の統計を取得・出力
+                // (GetStatsの戻り値が std::string である前提)
+                std::string statsBefore = tcmalloc::MallocExtension::GetStats();
+                logFile << "--- Stats BEFORE Release ---" << std::endl;
+                logFile << statsBefore << std::endl;
+
+                // 2. メモリ解放を実行
+                logFile << ">>> Calling ReleaseMemoryToSystem(-1)..." << std::endl;
+                size_t max_bytes = static_cast<size_t>(-1);
+                tcmalloc::MallocExtension::ReleaseMemoryToSystem(max_bytes);
+
+                // 3. 解放後の統計を取得・出力
+                std::string statsAfter = tcmalloc::MallocExtension::GetStats();
+                logFile << "--- Stats AFTER Release ---" << std::endl;
+                logFile << statsAfter << std::endl;
+                
+                logFile << "==========================================" << std::endl << std::endl;
+                logFile.close();
+            } else {
+                // ファイルが開けなかった場合は標準ログに出す（バックアップ）
+                LOGV2(0, "Failed to open log file /tmp/mongo_migration_test/tcmalloc_stats.log");
+            }
+        }
+        */
+        // ▲▲▲ 修正終了 ▲▲▲
+
         if (ret == 0) {
             result.append("msg", "Successfully executed wt_clear_cache");
             return true;

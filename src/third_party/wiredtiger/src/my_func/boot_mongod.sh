@@ -20,7 +20,7 @@ LOG_PATH="$DB_PATH/mongod.log"
 PORT=27017
 
 # データ量設定 (約1GBのデータを生成してキャッシュを埋める)
-DOC_COUNT=200000
+DOC_COUNT=1
 PADDING_SIZE=10240 
 
 echo "=================================================="
@@ -30,31 +30,6 @@ echo "Target Port: $PORT"
 echo "DB Path:     $DB_PATH"
 echo "Binary:      $MONGOD_BINARY"
 echo "--------------------------------------------------"
-
-# ==========================================
-# [関数] キャッシュ統計を表示するヘルパー
-# ==========================================
-check_cache_stats() {
-    local STEP_NAME="$1"
-    echo ""
-    echo "📊 --- [Stats] $STEP_NAME ---"
-    mongosh --quiet --port "$PORT" --eval "
-      try {
-          const status = db.serverStatus().wiredTiger.cache;
-          const bytes = status['bytes currently in the cache'];
-          const mb = (bytes / (1024 * 1024)).toFixed(2);
-          const pages = status['pages currently held in the cache'];
-          const dirty = status['tracked dirty pages in the cache'];
-          
-          print('  - Cache Size : ' + bytes + ' bytes (' + mb + ' MB)');
-          print('  - Total Pages: ' + pages);
-          print('  - Dirty Pages: ' + dirty);
-      } catch(e) {
-          print('Error getting stats: ' + e);
-      }
-    "
-    echo "------------------------------------------------"
-}
 
 # ==========================================
 # 2. 環境リセット & 起動
@@ -89,35 +64,6 @@ if ! pgrep -f "mongod.*$PORT" > /dev/null; then
     exit 1
 fi
 echo "✅ mongod started (PID: $(pgrep -f "mongod.*$PORT"))"
-
-# ==========================================
-# 3. データ挿入 (キャッシュ温め)
-# ==========================================
-echo "--- [Step 2] データ挿入 (約 1GB) ---"
-mongosh --quiet --port "$PORT" --eval "
-  const db = db.getSiblingDB('test_db');
-  db.my_table.drop();
-  const bulk = db.my_table.initializeUnorderedBulkOp();
-  
-  // QEMUでの検証用に 'A' (0x41) で埋める
-  const padding = 'A'.repeat($PADDING_SIZE); 
-
-  print('Preparing bulk insert...');
-  for (let i = 0; i < $DOC_COUNT; i++) {
-      bulk.insert({ 
-          _id: i, 
-          val: padding 
-      });
-      // 進捗表示
-      // if (i % 20000 == 0 && i > 0) print('  Prepared ' + i + ' documents...');
-  }
-  print('Executing bulk insert (this may take a while)...');
-  bulk.execute();
-  print('✅ Insert complete: $DOC_COUNT documents.');
-"
-
-# 統計確認: 挿入後
-check_cache_stats "データ挿入直後 (High Cache Usage)"
 
 echo ""
 echo "=================================================="

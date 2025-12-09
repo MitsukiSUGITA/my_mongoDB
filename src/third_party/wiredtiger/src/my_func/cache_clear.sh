@@ -22,7 +22,7 @@ PORT=27017
 
 # データ量設定 (約500MB)
 # DOC_COUNT=50000
-DOC_COUNT=100000
+DOC_COUNT=200000
 PADDING_SIZE=10240 
 
 echo "=================================================="
@@ -97,7 +97,7 @@ echo "✅ mongod started (PID: $(pgrep -f "mongod.*$PORT"))"
 # ==========================================
 # 3. データ挿入 (キャッシュ温め)
 # ==========================================
-echo "--- [Step 2] データ挿入 (約 500MB) ---"
+echo "--- [Step 2] データ挿入 ---"
 mongosh --quiet --port "$PORT" --eval "
   const db = db.getSiblingDB('test_db');
   db.my_table.drop();
@@ -112,7 +112,7 @@ mongosh --quiet --port "$PORT" --eval "
           val: padding 
       });
       // 進捗表示 (5000件ごと)
-      if (i % 5000 == 0 && i > 0) print('Prepared ' + i + ' documents...');
+      // if (i % 5000 == 0 && i > 0) print('Prepared ' + i + ' documents...');
   }
   print('Executing bulk insert (this may take a while)...');
   bulk.execute();

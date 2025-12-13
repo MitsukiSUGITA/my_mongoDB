@@ -292,7 +292,7 @@ __wti_connection_workers(WT_SESSION_IMPL *session, const char *cfg[])
       session, WT_VERB_RECOVERY, "%s", "WiredTiger utility threads started successfully");
 
     // ★追加: QEMU監視スレッドの起動(session->iface.connection で WT_CONNECTION* を取得して渡す)
-    //start_qemu_monitor(session->iface.connection);
+    start_qemu_monitor((WT_CONNECTION *)S2C(session));
 
     return (0);
 }

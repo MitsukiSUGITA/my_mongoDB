@@ -21,6 +21,7 @@
 #define QEMU_PORT_DATA_HIGH     0x1234
 #define QEMU_PORT_MONGO_EVICT   0x1240
 #define QEMU_PORT_MONGO_CMD     0x1241
+#define QEMU_PORT_MONGO_SYNC    0x1242
 bool clearing_cache = false;
 /* メタデータを格納するためのグローバルなリスト */
 CACHE_PAGE_INFO *metadata_list = NULL;
@@ -35,6 +36,11 @@ typedef struct {
     uint64_t gpa_list[BATCH_SIZE]; 
 } mongoDB_evict_List;
 
+// バッファの数を定義 (例: 4つ)
+#define EVICT_BUFFER_COUNT 4
+// リングバッファ
+static mongoDB_evict_List evict_buffers[EVICT_BUFFER_COUNT] __attribute__((aligned(4096)));
+static int current_buffer_index = 0;
 
 // グローバル変数としてリストを確保（スタックオーバーフロー防止）
 // posix_memalignなどでページ境界に合わせるとより安全です
@@ -3984,38 +3990,34 @@ static uintptr_t GVA_to_GPA(void *vaddr) {
 
 // QEMUにリストを送信する関数
 static void notify_qemu_eviction() {
+    mongoDB_evict_List *current_buffer = &evict_buffers[current_buffer_index];
     // カウント0ならロックする前に帰る
-    if (evict_list.count == 0) return;
+    if (current_buffer->count == 0) return;
     // 1. 物理アドレス変換 (ロックの外で行う方が効率が良い)
-    uintptr_t list_phys_addr = GVA_to_GPA(&evict_list);
-    // 変換失敗なら終了
-    if (list_phys_addr == 0) {
-        return;
-    }
-    // 2. 権限チェック
+    uintptr_t list_phys_addr = GVA_to_GPA(current_buffer);
+    if (list_phys_addr == 0) return;
+
+    // ★重要: 現在のスレッドがI/O権限を持っているかチェック
+    // すべてのスレッドで iopl(3) が必要です。ここが通らないと outl で死にます。
     if (iopl(3) < 0) {
-        static int iopl_error_printed = 0;
-        if (!iopl_error_printed) {
-            iopl_error_printed = 1;
-        }
-        return;
+        return; 
     }
+    // 2. ロック取得 (送信の直列化)
     pthread_mutex_lock(&qemu_lock);
-    // ロック取得後、念のため再度カウントチェック (他のスレッドが既に送ったかもしれない)
-    if (evict_list.count == 0) {
-        pthread_mutex_unlock(&qemu_lock);
-        return;
-    }
-    // メモリバリア
+    // メモリバリア(書き込み完了保証)
     __asm__ __volatile__("mfence" ::: "memory");
     
-    // 送信
+    // QEMUへアドレス通知 (32bit x 2)
     outl((uint32_t)(list_phys_addr & 0xFFFFFFFF), QEMU_PORT_DATA_LOW);
-    outl((uint32_t)(list_phys_addr >> 32), QEMU_PORT_DATA_HIGH);    
-    outl(1, QEMU_PORT_MONGO_EVICT); // トリガー
-    total_notified_pages += evict_list.count;
-    
-    evict_list.count = 0; // リセット
+    outl((uint32_t)(list_phys_addr >> 32), QEMU_PORT_DATA_HIGH);
+    // 3. トリガー発火
+    // この outl が完了した時点で、QEMUはデータを内部バッファにコピーし終えている(Fast Path)   
+    outl(1, QEMU_PORT_MONGO_EVICT);
+    total_notified_pages += current_buffer->count;
+
+    current_buffer->count = 0; // リセット
+    // 次のバッファへ切り替え (リングバッファ)
+    current_buffer_index = (current_buffer_index + 1) % EVICT_BUFFER_COUNT;
     pthread_mutex_unlock(&qemu_lock);// ロック解除
 }
 
@@ -4023,17 +4025,35 @@ static void notify_qemu_eviction() {
 static void 
 add_mongoDB_evict_List(uintptr_t GVA, uintptr_t GPA) 
 {
+    // 現在のバッファへのポインタ
+    mongoDB_evict_List *current_buffer = &evict_buffers[current_buffer_index];
 
     if (GPA != 0) {
-        // グローバルリストに追加
-        evict_list.gpa_list[evict_list.count++] = (uint64_t)GPA;
-        evict_list.total_pages++;
+        current_buffer->gpa_list[current_buffer->count++] = (uint64_t)GPA;
+        current_buffer->total_pages++;
         
         // バッファがいっぱいなら送信
-        if (evict_list.count >= BATCH_SIZE) {
-            notify_qemu_eviction();
+        if (current_buffer->count >= BATCH_SIZE) {
+            notify_qemu_eviction(); // 送信関数へ (current_bufferを使うよう修正)
         }
     }
+}
+
+/*
+ * QEMU側の非同期処理（BH）がすべて完了するまで待機する
+ */
+static void sync_with_qemu_eviction() {
+    my_log("[DEBUG] Syncing with QEMU BH completion (Port 0x1242)...\n");
+    // IOPL権限チェック（必須）
+    if (iopl(3) < 0) {
+        my_log("[CRITICAL ERROR] iopl(3) failed for sync port.\n");
+        return; 
+    }
+    
+    // QEMUへ同期要求を送信。この outl が QEMU 側の wait_for_evict_bh_completion 
+    // 関数をトリガーし、キューが空になるまでブロックされます。
+    outl(1, QEMU_PORT_MONGO_SYNC);
+    my_log("[DEBUG] Sync completed. Skip list is now up-to-date.\n");
 }
 
 // QEMUからの指令を待つスレッド
@@ -4206,6 +4226,9 @@ wt_clear_cache(WT_CONNECTION *connection)
             ret = 0;
             break;
         }
+
+        // QEMUの非同期処理が完了するのを待つ
+        sync_with_qemu_eviction();
         
         // 4. 退避実行： 在庫があるなら、walkの結果に関わらず退避を試みる
         if (total_entries > 0) {

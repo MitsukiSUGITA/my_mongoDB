@@ -3563,6 +3563,21 @@ void read_metadata(const char *dbname)
     return;
 }
 
+#define MY_LOG_FILE "/tmp/mongo_migration_test/my_debug.log"
+static void my_log(const char *format, ...) {
+    // 追記モード(a)で開く
+    FILE *fp = fopen(MY_LOG_FILE, "a");
+    if (fp == NULL) return; // 開けなければ諦める（クラッシュさせない）
+    // 引数のフォーマット出力
+    va_list args;
+    va_start(args, format);
+    vfprintf(fp, format, args);
+    va_end(args);
+
+    fflush(fp);
+    fclose(fp);
+}
+
 /*
  * グローバル変数に保存されたメタデータリストを元に、キャッシュを再構成（ウォームアップ）する
  */
@@ -3574,53 +3589,48 @@ wt_reconstruct_cache(WT_CONNECTION *connection)
     WT_CURSOR *cursor = NULL;
     int ret = 0;
     char last_uri[256] = "";
-    
-    // バイナリデータを扱うためのキー用アイテム
-    WT_ITEM key_item;
+    WT_ITEM key_item; // バイナリデータを扱うためのキー用アイテム
 
     // メモリ上のグローバル変数をチェック
     if (metadata_list == NULL || metadata_count == 0) {
-        printf("No metadata in memory. Skipping reconstruction.\n");
+        my_log("No metadata in memory. Skipping reconstruction.\n");
         return (0);
     }
 
     // 1. セッションを開く (公開API)
     if ((ret = connection->open_session(connection, NULL, NULL, &session)) != 0) {
-        fprintf(stderr, "Error: open_session failed: %s\n", wiredtiger_strerror(ret));
+        my_log("Error: open_session failed: %s\n", wiredtiger_strerror(ret));
         return (ret);
     }
 
-    printf("Reconstructing %zu pages from memory list...\n", metadata_count);
+    my_log("Reconstructing %zu pages from memory list...\n", metadata_count);
 
     // 2. リストをループしてページをタッチする
     for (size_t i = 0; i < metadata_count; ++i) {
-        
+        CACHE_PAGE_INFO *info = &metadata_list[i];
         // URIが変わったらカーソルを開き直す
-        if (strcmp(last_uri, metadata_list[i].uri) != 0) {
+        if (strcmp(last_uri, info->uri) != 0) {
             if (cursor != NULL) {
                 cursor->close(cursor);
                 cursor = NULL;
             }
-            if ((ret = session->open_cursor(session, metadata_list[i].uri, NULL, NULL, &cursor)) != 0) {
+            if ((ret = session->open_cursor(session, info->uri, NULL, NULL, &cursor)) != 0) {
                 // インデックスやメタデータテーブルなど、開けないものはスキップして続行
                 continue; 
             }
-            strncpy(last_uri, metadata_list[i].uri, sizeof(last_uri) - 1);
+            strncpy(last_uri, info->uri, sizeof(last_uri) - 1);
         }
+        if (cursor != NULL && info->child_key_size > 0) {
+            // キーを設定
+            key_item.data = info->child_key;
+            key_item.size = info->child_key_size;
+            cursor->set_key(cursor, &key_item);
 
-        if (cursor == NULL) continue;
-
-        // キーを設定 (バイナリセーフ)
-        key_item.data = metadata_list[i].child_key;
-        key_item.size = metadata_list[i].child_key_size;
-        cursor->set_key(cursor, &key_item);
-
-        // ★★★ 検索実行！これでデータがキャッシュに乗ります ★★★
-        ret = cursor->search(cursor);
-        
-        // 結果はチェックしなくてOK (キャッシュに乗ればよいので)
-        if (ret != 0 && ret != WT_NOTFOUND) {
-             // エラーハンドリングが必要ならここに
+            // ★ searchを実行することで、ディスクから該当ページがキャッシュにロードされる
+            if ((ret = cursor->search(cursor)) != 0) {
+                // Not foundでもキャッシュロードの目的は達せられる場合があるため継続
+            }
+            cursor->reset(cursor); 
         }
     }
 

@@ -78,6 +78,7 @@ static void my_log(const char *format, ...);
 static uintptr_t GVA_to_GPA(void *vaddr);
 static void add_mongoDB_evict_List(uintptr_t GVA, uintptr_t GPA);
 static void __filter_single_queue(WTI_EVICT_QUEUE *q);
+extern int wt_reconstruct_cache(WT_CONNECTION *connection);
 
 #include <stdlib.h> // malloc, realloc, free を使うために必要
 
@@ -3092,7 +3093,7 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
         } else {
             // 既存の出力・保存関数を呼び出して、バッファにメタデータを保存
             //復元のための関数であり、転送スキップのためには使わないから一時的にコメントアウトする
-            //save_page_info_to_buffer(btree, ref, &page_info_buffer);
+            save_page_info_to_buffer(btree, ref, &page_info_buffer);
             // 最大 1MB (4KB * 256) 程度まで対応可能な一時バッファを用意
             #define MAX_TEMP_GPAS 4096
             uint64_t temp_gpas[MAX_TEMP_GPAS];
@@ -4072,27 +4073,47 @@ static void* qemu_monitor_thread(void *arg) {
     }
 
     while (true) {
+        // QEMUにマイグレーション完了を問い合わせるトリガー
+        outl(0xFF, QEMU_PORT_MONGO_CMD);
         // 1. QEMUからのトリガーを監視 (ポート 0x1241)
         uint32_t flag = inl(QEMU_PORT_MONGO_CMD);
         
         if (flag == 1) {
             my_log("[MONITOR] Migration Triggered! Executing wt_clear_cache...\n");
-            
             // 2. フラグをリセット (cknowledge)
             outl(0, QEMU_PORT_MONGO_CMD);
-
             // 3. キャッシュクリア実行 (この中でQEMUとの同期も行われる)
             wt_clear_cache(conn);
-
-            // ★ 4. 完了通知: QEMUの待機(qemu_sem_wait)を解除させる
+            // 4. 完了通知: QEMUの待機(qemu_sem_wait)を解除させる
             my_log("[MONITOR] Cache Clear Finished. Notifying QEMU (Port 0x1243)...\n");
             outl(1, QEMU_PORT_MONGO_DONE); 
-            
             my_log("[MONITOR] QEMU Notified. Resume monitoring.\n");
+        } else if (flag == 3) {
+            // キャッシュ復元処理 (Destination側)
+            my_log("[MONITOR] Restore Signal Received! Starting Reconstruction...\n");
+            // フラグをリセット
+            outl(0, QEMU_PORT_MONGO_CMD);
+            // メタデータが存在するか確認（転送されてきているはず）
+            if (metadata_list != NULL && metadata_count > 0) {
+                my_log("[MONITOR] Found %zu pages in metadata. Reconstructing...\n", metadata_count);
+                // 復元実行
+                int ret = wt_reconstruct_cache(conn);
+                if (ret == 0) {
+                    my_log("[MONITOR] Cache reconstruction COMPLETED.\n");
+                } else {
+                    my_log("[MONITOR] Cache reconstruction FAILED code=%d.\n", ret);
+                }
+                // 復元が終わったらメモリ解放（必要に応じて）
+                /*
+                free(metadata_list);
+                metadata_list = NULL;
+                metadata_count = 0;
+                */
+            } else {
+                my_log("[MONITOR] No metadata found via migration. Skipping.\n");
+            }
         }
-        
         // ポーリング間隔: 100ms (100000us) 程度が適切
-        // 10秒(10000000us)は長すぎて反応が遅れる可能性があります
         usleep(100000); 
     }
     return NULL;

@@ -16,3 +16,5 @@ shell/msvc/ipch/
 # Embedded Git repository (Optional, but clean)
 external/mongo
 
+venv/
+build.log

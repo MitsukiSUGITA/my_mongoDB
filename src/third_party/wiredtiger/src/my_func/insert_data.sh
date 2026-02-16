@@ -1,6 +1,14 @@
 #!/bin/bash
 set -e # エラーが発生したら即停止
 
+# --- 引数で設定を受け取る (デフォルト値は以前の実験設定) ---
+# 第1引数: MongoDBキャッシュサイズ (GB)
+#CACHE_SIZE_GB=${1:-1} 
+# 第2引数: ドキュメント数 (1件10KB計算)
+# 例: 200,000件 ≒ 2GB, 2,500,000件 ≒ 25GB
+#INPUT_DOC_COUNT=${2:-200000}
+INPUT_DOC_COUNT=${1:-200000}
+
 # --- Root権限チェック ---
 if [ "$EUID" -ne 0 ]; then
   echo "❌ Error: This script must be run as root (sudo)."
@@ -12,23 +20,18 @@ fi
 # ==========================================
 # VM内のmongodへのパス
 MONGOD_BINARY="./mongod"
-
 # テスト用DBとログの場所
 DB_PATH="/tmp/mongo_migration_test"
 LOG_PATH="$DB_PATH/mongod.log"
-
 PORT=27017
-
-# データ量設定 (約1GBのデータを生成してキャッシュを埋める)
-DOC_COUNT=200000
 PADDING_SIZE=10240 
 
 echo "=================================================="
 echo "      MongoDB Data Insertion (Cache Warmer)       "
 echo "=================================================="
-echo "Target Port: $PORT"
-echo "DB Path:     $DB_PATH"
-echo "Binary:      $MONGOD_BINARY"
+#echo "Cache Size:  ${CACHE_SIZE_GB} GB"
+echo "Doc Count:   ${INPUT_DOC_COUNT}"
+echo "Approx Data: $(( INPUT_DOC_COUNT * PADDING_SIZE / 1024 / 1024 )) MB"
 echo "--------------------------------------------------"
 
 # ==========================================
@@ -41,14 +44,31 @@ check_cache_stats() {
     mongosh --quiet --port "$PORT" --eval "
       try {
           const status = db.serverStatus().wiredTiger.cache;
-          const bytes = status['bytes currently in the cache'];
-          const mb = (bytes / (1024 * 1024)).toFixed(2);
-          const pages = status['pages currently held in the cache'];
-          const dirty = status['tracked dirty pages in the cache'];
           
-          print('  - Cache Size : ' + bytes + ' bytes (' + mb + ' MB)');
-          print('  - Total Pages: ' + pages);
-          print('  - Dirty Pages: ' + dirty);
+          // 基本的なサイズ情報
+          const bytes = status['bytes currently in the cache'];
+          const max_bytes = status['maximum bytes configured'];
+          const dirty_bytes = status['tracked dirty bytes in the cache'];
+          
+          // ページ数情報
+          const pages = status['pages currently held in the cache'];
+          const dirty_pages = status['tracked dirty pages in the cache'];
+          
+          // 計算（MB/GB変換とパーセンテージ）
+          const gb = (bytes / (1024 * 1024 * 1024)).toFixed(2);
+          const max_gb = (max_bytes / (1024 * 1024 * 1024)).toFixed(2);
+          const dirty_gb = (dirty_bytes / (1024 * 1024 * 1024)).toFixed(2);
+          const dirty_percent = (dirty_bytes / bytes * 100).toFixed(2);
+          const usage_percent = (bytes / max_bytes * 100).toFixed(2);
+
+          print('  - Max Configured: ' + max_gb + ' GB');
+          print('  - Current Cache : ' + bytes + ' bytes (' + gb + ' GB)');
+          print('  - Usage Rate    : ' + usage_percent + ' %');
+          print('  - Dirty Data    : ' + dirty_bytes + ' bytes (' + dirty_gb + ' GB)');
+          print('  - Dirty Rate    : ' + dirty_percent + ' % (Target: >90%)');
+          print('  --------------------------------');
+          print('  - Total Pages   : ' + pages);
+          print('  - Dirty Pages   : ' + dirty_pages);
       } catch(e) {
           print('Error getting stats: ' + e);
       }
@@ -77,7 +97,10 @@ echo "Starting mongod..."
 # 起動 (キャッシュサイズを1GBに固定して、データがメモリに載るようにする)
 "$MONGOD_BINARY" --fork --dbpath "$DB_PATH" --logpath "$LOG_PATH" \
   --port "$PORT" --bind_ip 127.0.0.1 \
-  --wiredTigerCacheSizeGB 1
+  --syncdelay 3600 \
+  --wiredTigerEngineConfigString "checkpoint=(wait=3600),eviction_dirty_target=90,eviction_dirty_trigger=95,eviction_target=95,eviction_trigger=99"
+  #  --wiredTigerEngineConfigString "checkpoint=(wait=3600),eviction_dirty_target=90,eviction_dirty_trigger=95,eviction_target=95,eviction_trigger=99"
+#  --wiredTigerCacheSizeGB "$CACHE_SIZE_GB"
 
 sleep 5
 
@@ -93,7 +116,7 @@ echo "✅ mongod started (PID: $(pgrep -f "mongod.*$PORT"))"
 # ==========================================
 # 3. データ挿入 (キャッシュ温め)
 # ==========================================
-echo "--- [Step 2] データ挿入 (約 1GB) ---"
+#echo "--- [Step 2] データ挿入 (約 $CACHE_SIZE_GB GB) ---"
 mongosh --quiet --port "$PORT" --eval "
   const db = db.getSiblingDB('test_db');
   db.my_table.drop();
@@ -103,7 +126,7 @@ mongosh --quiet --port "$PORT" --eval "
   const padding = 'A'.repeat($PADDING_SIZE); 
 
   print('Preparing bulk insert...');
-  for (let i = 0; i < $DOC_COUNT; i++) {
+  for (let i = 0; i < $INPUT_DOC_COUNT; i++) {
       bulk.insert({ 
           _id: i, 
           val: padding 
@@ -113,8 +136,14 @@ mongosh --quiet --port "$PORT" --eval "
   }
   print('Executing bulk insert (this may take a while)...');
   bulk.execute();
-  print('✅ Insert complete: $DOC_COUNT documents.');
+  print('✅ Insert complete: $INPUT_DOC_COUNT documents.');
+
+  print('🔄 Force-updating all documents to maximize Dirty Rate...');
+  // 全ドキュメントのフラグを書き換える
+  db.my_table.updateMany({}, { \$set: { dirty_flag: 1 } });
+  print('✅ Update complete.');
 "
+
 
 # 統計確認: 挿入後
 check_cache_stats "データ挿入直後 (High Cache Usage)"

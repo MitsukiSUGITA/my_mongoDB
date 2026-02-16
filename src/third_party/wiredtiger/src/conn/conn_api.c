@@ -10,12 +10,8 @@
 
 /* 退避サーバへの一時停止「リクエスト」用フラグ (0: 動作, 1: 停止リクエスト) */
 volatile uint32_t eviction_server_pause_request = 0;
-
 /* 退避サーバが実際に一時停止したことを示す「状態」フラグ (0: 動作中, 1: 停止中) */
 volatile uint32_t eviction_server_is_paused = 0;
-
-extern REF_WITH_CONTEXT *ref_list;
-extern size_t ref_count;
 
 void print_key_hex(const uint8_t *data, size_t size);
 void print_clear_page_info(WT_SESSION_IMPL *session, const char *title, WT_BTREE *btree, WT_REF *ref, int is_before);

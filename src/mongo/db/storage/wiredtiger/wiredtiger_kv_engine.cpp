@@ -293,8 +293,9 @@ public:
                 _condvar.wait_for(lock, stdx::chrono::seconds(kDebugBuild ? 1 : 10));
             }
 
-            _connection->closeExpiredIdleSessions(gWiredTigerSessionCloseIdleTimeSecs.load() *
-                                                  1000);
+            // 無力化して古いメモリへのアクセスを防ぐ
+            //_connection->closeExpiredIdleSessions(gWiredTigerSessionCloseIdleTimeSecs.load() *
+            //                                      1000);
         }
         LOGV2_DEBUG(22304, 1, "stopping {name} thread", "name"_attr = name());
     }

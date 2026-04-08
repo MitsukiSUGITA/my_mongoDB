@@ -93,12 +93,22 @@ rm -f "$DB_PATH/my_debug.log"
 touch "$DB_PATH/my_debug.log"
 chmod 777 "$DB_PATH/my_debug.log"
 
+# 🌟 追加箇所：コアダンプとtcmallocの設定
+echo "Applying Core Dump and TCMALLOC settings..."
+
+# 1. コアダンプのサイズ制限を無効化（このプロセスから派生するmongodに引き継がれる）
+ulimit -c unlimited
+
+# 2. 仮説検証: tcmallocのバックグラウンドスレッドによるメモリ解放を停止
+# これにより移行先のゼロページにアクセスしてクラッシュするのを防げるか確認する
+export TCMALLOC_RELEASE_RATE=0
+
 echo "Starting mongod..."
 # 起動 (キャッシュサイズを1GBに固定して、データがメモリに載るようにする)
 "$MONGOD_BINARY" --fork --dbpath "$DB_PATH" --logpath "$LOG_PATH" \
   --port "$PORT" --bind_ip 127.0.0.1 \
   --syncdelay 3600 \
-  --wiredTigerEngineConfigString "checkpoint=(wait=3600),eviction_dirty_target=90,eviction_dirty_trigger=95,eviction_target=95,eviction_trigger=99"
+  --wiredTigerEngineConfigString "mmap=false,checkpoint=(wait=3600),eviction_dirty_target=90,eviction_dirty_trigger=95,eviction_target=95,eviction_trigger=99"
   #  --wiredTigerEngineConfigString "checkpoint=(wait=3600),eviction_dirty_target=90,eviction_dirty_trigger=95,eviction_target=95,eviction_trigger=99"
 #  --wiredTigerCacheSizeGB "$CACHE_SIZE_GB"
 

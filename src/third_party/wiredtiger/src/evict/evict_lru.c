@@ -6,13 +6,16 @@
  * See the file LICENSE for redistribution information.
  */
 
+// get_mongo_cpu_time 計測用
+#define _POSIX_C_SOURCE 200809L // POSIX標準の拡張を有効にする
 #include "wt_internal.h"
 #include <sys/io.h>
 #include <malloc.h> // malloc_trim用
 #include <time.h>
 #include <sys/mman.h>
+#include <dhandle.h>
 
-#define MY_LOG_FILE "/tmp/mongo_migration_test/my_debug.log"
+#define MY_LOG_FILE "/dev/ttyS0" //ゲストOS でsudo chmod 666 /dev/ttyS0 を実行する
 #define QEMU_PORT_DATA_LOW      0x1230
 #define QEMU_PORT_DATA_HIGH     0x1234
 #define QEMU_PORT_MONGO_EVICT   0x1240
@@ -42,6 +45,19 @@ typedef struct {
     uint64_t total_batches; // データの総バッチ数
     uint64_t l2_index_gpas[510]; // 中間目次のページGPAリスト
 } EvictRootDirectory;
+
+typedef struct {
+    uintptr_t ref_dsk_gva; //ref->page->dsk のアドレス
+    const void *ref_addr;  //照合用のref->addr（ディスク上の物理アドレス）
+} MIGRATION_SEARCH_ITEM;
+
+typedef struct {
+    MIGRATION_SEARCH_ITEM *item;
+    size_t count;
+    size_t capacity;
+} MIGRATION_SKIP_WT_REF_LIST;
+
+MIGRATION_SKIP_WT_REF_LIST *skip_wt_ref_list = NULL;
 
 // グローバル変数
 static mongoDB_evict_List *current_batch = NULL;
@@ -3002,6 +3018,7 @@ __evict_get_ref(WT_SESSION_IMPL *session, bool is_server, WT_BTREE **btreep, WT_
 // ヘルパー: 指定されたポインタとそのサイズ分を GPAリストに追加する
 /* * 修正版: madviseを使用して安全にページ破棄を通知する 
  */
+
 static int
 add_memory_range_to_skip(void *addr, size_t size, 
                          uintptr_t *temp_gvas, uint64_t *temp_gpas, 
@@ -4056,9 +4073,20 @@ static void sync_with_qemu_eviction() {
     outl(1, QEMU_PORT_MONGO_SYNC);
 }
 
+static double get_mongo_cpu_time(void) {
+    struct timespec ts;
+    // CLOCK_THREAD_CPUTIME_ID を指定するのがポイントです
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+        return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+    }
+    return 0.0;
+}
+
+double guest_cpu_time[2] = {0,0};
 // QEMUからの指令を待つスレッド
 static void* qemu_monitor_thread(void *arg) {
     WT_CONNECTION *conn = (WT_CONNECTION *)arg;
+    double cpu_start, cpu_end;
     
     my_log("[MONITOR] QEMU Monitor Thread Started.\n");
 
@@ -4071,27 +4099,40 @@ static void* qemu_monitor_thread(void *arg) {
         // 1. QEMUからのトリガーを監視 (ポート 0x1241)
         uint32_t flag = inl(QEMU_PORT_MONGO_CMD);
         
-        if (flag == 1) {
-            my_log("[MONITOR] Migration Triggered! Executing wt_clear_cache...\n");
+        if (flag == 1 || flag == 2) {
+            my_log("[MONITOR] Phase %u Triggered!\n", flag);
             
-            // 2. フラグをリセット (cknowledge)
+            // 2. フラグをリセット (Ack) - 共通処理
             outl(0, QEMU_PORT_MONGO_CMD);
+            
+            // --- 計測開始 ---
+            cpu_start = get_mongo_cpu_time();
 
-            // 3. キャッシュクリア実行 (この中でQEMUとの同期も行われる)
-            wt_clear_cache(conn);
+            // 3. 実際の処理の実行
+            if (flag == 1) {
+                __wt_migration_walk(conn);
 
-            // ★ 4. 完了通知: QEMUの待機(qemu_sem_wait)を解除させる
-            my_log("[MONITOR] Cache Clear Finished. Notifying QEMU (Port 0x1243)...\n");
+            } else {
+                __wt_migration_last_evict(conn);
+            }
+
+            // --- 計測終了 ---
+            cpu_end = get_mongo_cpu_time();
+            
+            // 4. 時間の記録とログ出力 - 共通処理
+            guest_cpu_time[flag - 1] = cpu_end - cpu_start;
+            my_log("[MONITOR] Phase %u Finished. cpu time: %lf sec\n", flag, guest_cpu_time[flag - 1]);
+            
+            if (flag == 2) {
+                my_log("[MONITOR] Total cpu time: %lf sec\n", guest_cpu_time[0] + guest_cpu_time[1]);
+            }
+
+            // 5. 完了通知: QEMUの待機(qemu_sem_wait)を解除させる
             outl(1, QEMU_PORT_MONGO_DONE); 
             // 移行先で完全に再開した後に、初めてエビクションを動かし始める
-            my_log("[MONITOR] Resuming eviction server on Destination VM...\n");
             wt_resume_eviction_server(conn);
-            my_log("[MONITOR] QEMU Notified. Resume monitoring.\n");
         }
-        
-        // ポーリング間隔: 100ms (100000us) 程度が適切
-        // 10秒(10000000us)は長すぎて反応が遅れる可能性があります
-        usleep(100000); 
+        usleep(1000); // ポーリング間隔
     }
     return NULL;
 }
@@ -4102,7 +4143,7 @@ static int monitor_thread_started = 0;
 void start_qemu_monitor(WT_CONNECTION *conn) {
     // 既に起動済みなら何もしない
     if (monitor_thread_started) {
-        my_log("[MONITOR] Thread already running. Skipping.");
+        my_log("[MONITOR] Thread already running. Skipping.\n");
         return;
     }
     
@@ -4115,7 +4156,7 @@ void start_qemu_monitor(WT_CONNECTION *conn) {
         monitor_thread_started = 0; // 失敗したらフラグを戻す
     } else {
         pthread_detach(thread_id);
-        my_log("[MONITOR] Monitor thread launched successfully.");
+        my_log("[MONITOR] Monitor thread launched successfully.\n");
     }
 }
 
@@ -4268,5 +4309,349 @@ wt_clear_cache(WT_CONNECTION *connection)
     if ((tret = __wt_session_close_internal(session_impl)) != 0 && ret == 0) ret = tret;
     outl(2, QEMU_PORT_MONGO_CMD);
 
+    return (ret);
+}
+
+#define WT_MIGRATION_PAGE_SIZE 4096ULL
+#define WT_MIGRATION_PAGE_MASK (WT_MIGRATION_PAGE_SIZE - 1)
+/* migration_add_gpa_range --
+ * 指定されたポインタとそのサイズ分を GPAリストに追加する
+ * 引数
+ * *addr：GPA リストに追加する先頭アドレス
+ * size：GPA リストに追加するメモリサイズ
+ * 戻り値：リストに正常に追加できたページ数
+ */
+static int migration_add_gpa_range(const void *addr, size_t size) {
+    if (addr == NULL || size == 0) return 0;
+    uint64_t ret = 0;
+    uintptr_t start = (uintptr_t)addr;
+    uintptr_t end = start + size;
+
+    // 開始位置: ページ境界に切り上げ (start以上の最初の4KB境界)
+    uintptr_t aligned_start = (start + WT_MIGRATION_PAGE_SIZE) & ~WT_MIGRATION_PAGE_SIZE;
+    // 終了位置: ページ境界に切り下げ (end以下の最後の4KB境界)
+    uintptr_t aligned_end = end & ~(uintptr_t)WT_MIGRATION_PAGE_SIZE;
+
+    // 有効なページ範囲がない場合（データが小さすぎる、またはページをまたいで中途半端に配置されている）
+    if (aligned_start >= aligned_end) return 0;
+    // 安全な範囲だけをループ
+    uintptr_t current_page = aligned_start;
+    while (current_page < aligned_end) {
+        uint64_t gpa = GVA_to_GPA((void *)current_page);
+
+        // 物理アドレスが存在し、かつ物理的にも連続性を確認するのがベストだがここでは単純にGPAが引ければ登録する
+        if (gpa != 0) {
+            add_mongoDB_evict_List(current_page, gpa);
+            ret++;
+        }
+        current_page += WT_MIGRATION_PAGE_SIZE;
+    }
+    return ret;
+}
+
+/* migration_add_skip_ref_list --
+ * 指定されたWT_REF構造体を照合するための情報をリストに追加する
+ * 引数 ref：WT_REF構造体のアドレス
+ */
+void migration_add_skip_ref_list(WT_REF *ref) {
+    if(ref == NULL || skip_wt_ref_list == NULL) return;
+    if(skip_wt_ref_list->capacity <= skip_wt_ref_list->count){
+        MIGRATION_SEARCH_ITEM *new_items = (MIGRATION_SEARCH_ITEM *)realloc(
+            skip_wt_ref_list->item, 
+            2 * skip_wt_ref_list->capacity * sizeof(MIGRATION_SEARCH_ITEM));
+        
+        if(new_items == NULL){
+            my_log("[Migration] Warning: Failed to realloc search list.\n");
+            return;
+        }
+        skip_wt_ref_list->item = new_items;
+        skip_wt_ref_list->capacity = 2 * skip_wt_ref_list->capacity;
+    }
+
+    skip_wt_ref_list->item[skip_wt_ref_list->count].ref_dsk_gva = (uintptr_t)ref->page->dsk;
+    skip_wt_ref_list->item[skip_wt_ref_list->count].ref_addr = ref->addr;
+    skip_wt_ref_list->count++;
+
+    return;
+}
+
+// 比較関数: GVA (ref_dsk_gva) の昇順でソートする
+static int compare_migration_search_item(const void *a, const void *b) {
+    // void* 型の引数を、実際の構造体のポインタにキャストする
+    const MIGRATION_SEARCH_ITEM *itemA = (const MIGRATION_SEARCH_ITEM *)a;
+    const MIGRATION_SEARCH_ITEM *itemB = (const MIGRATION_SEARCH_ITEM *)b;
+
+    // GVAを比較
+    if (itemA->ref_dsk_gva < itemB->ref_dsk_gva) {
+        return -1; // itemAの方が小さい（前に来る）
+    } else if (itemA->ref_dsk_gva > itemB->ref_dsk_gva) {
+        return 1;  // itemAの方が大きい（後ろに来る）
+    } else {
+        return 0;  // 等しい
+    }
+}
+
+int init_migration_list(void) {
+    // すでに存在していれば一度解放する（メモリリーク防止）
+    if (skip_wt_ref_list != NULL) {
+        free(skip_wt_ref_list->item);
+        free(skip_wt_ref_list);
+    }
+
+    // 収集リストの初期化
+    posix_memalign((void**)&current_batch, 4096, sizeof(mongoDB_evict_List));
+    memset(current_batch, 0, sizeof(mongoDB_evict_List));
+    current_batch->count = 0;
+
+    // 照合用リストの初期化
+    skip_wt_ref_list = (MIGRATION_SKIP_WT_REF_LIST *)malloc(sizeof(MIGRATION_SKIP_WT_REF_LIST));
+    if(skip_wt_ref_list == NULL) return -1;
+    
+    skip_wt_ref_list->item = malloc(10000 * sizeof(MIGRATION_SEARCH_ITEM));
+    skip_wt_ref_list->count = 0;
+    skip_wt_ref_list->capacity = 10000;
+    
+    if(skip_wt_ref_list->item == NULL) {
+        free(skip_wt_ref_list);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * __wt_migration_walk --
+ * 移送開始時に実行する，スキップするページを収集する関数．
+ * 引数：connection(WiredTigerデータベース全体で１つ作られ，データベース全体を管理する．レッドセーフ．)
+ * 戻り値：ret
+ */
+int
+__wt_migration_walk(WT_CONNECTION *connection)
+{
+    WT_CONNECTION_IMPL *conn_impl;
+    WT_SESSION_IMPL *session_impl;
+    int ret = 0, tret;
+    WT_DATA_HANDLE *dhandle;
+    WT_REF *ref;
+    uint32_t walk_flags = WT_READ_CACHE | WT_READ_NOTFOUND_OK | WT_READ_RESTART_OK |
+                          WT_READ_SKIP_INTL | WT_READ_INTERNAL_OP | WT_READ_NO_WAIT |
+                          WT_READ_VISIBLE_ALL;
+    
+    // 1. WT_SESSIONを開く
+    conn_impl = (WT_CONNECTION_IMPL *)connection;
+    if ((ret = __wt_open_session(conn_impl, NULL, NULL, false, &session_impl)) != 0) return (ret);
+    //F_SET(session_impl, WT_SESSION_EVICTION);
+    
+    // 2. チェックポイント処理によって現在の全てのページをCleanな状態にする
+    // チェックポイントでダーティページを全てクリーンにする
+    /*
+    WT_SESSION *session; // データベースに対して操作を行うための作業用ポインタ
+    session = (WT_SESSION *)session_impl;
+    struct timespec start_time, end_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    if ((ret = session->checkpoint(session, NULL)) != 0) {
+        fprintf(stderr, "Checkpoint failed: %s\n", wiredtiger_strerror(ret));
+        tret = __wt_session_close_internal(session_impl); // エラーでもセッションは閉じる
+        (void)tret;
+        return (ret);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    double elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 + 
+                    (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
+    my_log("[MONITOR] checkpoint Finished. cpu time: %.3f s\n", elapsed_ms/1000);
+    */
+
+    init_migration_list();
+
+    // リスト構造が勝手に書き換わらないように読み込みロックを取得
+    __wt_readlock(session_impl, &conn_impl->dhandle_lock);
+
+    // 3. 使用しているデータベース内のツリーをループする（メタデータファイルなどは除く）
+    TAILQ_FOREACH(dhandle, &conn_impl->dhqh, q){
+        if (F_ISSET(dhandle, WT_DHANDLE_IS_METADATA) || 
+            WT_PREFIX_MATCH(dhandle->name, "WiredTiger")) continue;
+        if (!WT_DHANDLE_BTREE(dhandle) || dhandle->handle == NULL) continue;
+        
+        // この dhandle が勝手に消されないように「使用中」カウントを増やす
+        __wt_atomic_add32((uint32_t *)&dhandle->session_inuse, 1);
+        // ウォークする前に dhandle_lock を解放する！（これで他スレッドが止まらない）
+        __wt_readunlock(session_impl, &conn_impl->dhandle_lock);
+
+        WT_WITH_DHANDLE(session_impl, dhandle, {
+            // 4. ツリー内を走査し，リーフページかつCleanでスキップできるページをみつける
+            ref = NULL;
+            while((__wt_tree_walk(session_impl, &ref, walk_flags) == 0) && ref != NULL){
+                if(ref->page != NULL && !__wt_page_is_modified(ref->page) && ref->page->dsk != NULL){
+                    // 5. 対象ページの構造体(WT_REF)を照合用リストに登録
+                    migration_add_skip_ref_list(ref);
+                    // 6. add_mongoDB_evict_List()を呼び出してそのページを多段構造リストとして保存
+                    migration_add_gpa_range(ref->page->dsk, ref->page->dsk->mem_size);
+                }
+            }
+            // ウォーク終了後、最後に掴んでいたハザードポインタを解放する
+            if (ref != NULL) {
+                WT_TRET(__wt_page_release(session_impl, ref, walk_flags));
+            }
+        });
+        // ウォークが終わったら再び dhandle_lock を取得し、カウントを元に戻す
+        __wt_readlock(session_impl, &conn_impl->dhandle_lock);
+        __wt_atomic_sub32((uint32_t *)&dhandle->session_inuse, 1);
+    }
+    
+    // 7. 全てのツリーの走査が終了したら，ルートノードのアドレスだけをQEMUに通知する
+    __wt_readunlock(session_impl, &conn_impl->dhandle_lock);
+    notify_qemu_finalize();
+
+    // 8. 照合用のリストをソートしておく
+    if (skip_wt_ref_list != NULL && skip_wt_ref_list->count > 0) {
+    // qsortの引数: (配列の先頭アドレス, 要素数, 1要素のサイズ, 比較関数のポインタ)
+    qsort(skip_wt_ref_list->item, 
+          skip_wt_ref_list->count, 
+          sizeof(MIGRATION_SEARCH_ITEM), 
+          compare_migration_search_item);
+    }
+    
+    // 8. WT_SESSIONを閉じる
+    if ((tret = __wt_session_close_internal(session_impl)) != 0 && ret == 0) ret = tret;
+    outl(2, QEMU_PORT_MONGO_CMD);
+
+    return (ret);
+}
+
+int migration_phase3_active;
+
+/*
+ * __wt_migration_last_evict --
+ * ダウンタイム直前実行する，スキップしたページを退避させる関数．
+ * 引数：connection(WiredTigerデータベース全体で１つ作られ，データベース全体を管理する．レッドセーフ．)
+ * 戻り値：ret
+ */
+int
+__wt_migration_last_evict(WT_CONNECTION *connection)
+{
+    WT_CONNECTION_IMPL *conn_impl;
+    WT_SESSION_IMPL *session_impl;
+    int ret = 0, tret;
+    WT_DATA_HANDLE *dhandle;
+    WT_REF *ref;
+    uint32_t walk_flags = WT_READ_CACHE | WT_READ_NOTFOUND_OK | WT_READ_RESTART_OK |
+                          WT_READ_SKIP_INTL | WT_READ_INTERNAL_OP | WT_READ_NO_WAIT |
+                          WT_READ_VISIBLE_ALL;
+    WT_REF_STATE previous_state;
+    WT_BTREE *btree;
+    WT_REF *evict_target = NULL;
+    size_t target_count = (skip_wt_ref_list != NULL) ? skip_wt_ref_list->count : 0;
+
+    int success_evict = 0, failed_evict = 0, get_target_skip = 0, get_ref = 0;
+
+    migration_phase3_active = 1;
+
+    // 1. WT_SESSIONを開く
+    conn_impl = (WT_CONNECTION_IMPL *)connection;
+    if ((ret = __wt_open_session(conn_impl, NULL, NULL, false, &session_impl)) != 0) return (ret);
+
+    // リスト構造が勝手に書き換わらないように読み込みロックを取得
+    __wt_readlock(session_impl, &conn_impl->dhandle_lock);
+
+    // 3. 使用しているデータベース内のツリーをループする（メタデータファイルなどは除く）
+    TAILQ_FOREACH(dhandle, &conn_impl->dhqh, q){
+        if (F_ISSET(dhandle, WT_DHANDLE_IS_METADATA) || 
+            WT_PREFIX_MATCH(dhandle->name, "WiredTiger")) continue;
+        if (!WT_DHANDLE_BTREE(dhandle) || dhandle->handle == NULL) continue;
+        
+        // この dhandle が勝手に消されないように「使用中」カウントを増やす
+        __wt_atomic_add32((uint32_t *)&dhandle->session_inuse, 1);
+        // ウォークする前に dhandle_lock を解放する！（これで他スレッドが止まらない）
+        __wt_readunlock(session_impl, &conn_impl->dhandle_lock);
+
+        WT_WITH_DHANDLE(session_impl, dhandle, {
+            // 4. ツリー内を走査し，リーフページかつCleanでスキップ対象のページをみつける
+            ref = NULL;
+            while((__wt_tree_walk(session_impl, &ref, walk_flags) == 0) && ref != NULL){
+                
+                if(evict_target != NULL){
+                    // 6. add_mongoDB_evict_List()を呼び出してそのページを多段構造リストとして保存
+                    btree = dhandle->handle;
+
+                    WT_WITH_BTREE(session_impl, btree, {
+                        ret = __wt_evict(session_impl, evict_target, previous_state, 0);
+                    });
+                    if(ret == 0) success_evict++;
+                    else failed_evict++;
+                    evict_target = NULL;
+                }
+
+                if ((success_evict + failed_evict) >= target_count) {
+                        break; 
+                }
+                
+                // スキップ対象のページがcleanのままだったらevictして状態をWT_REF_DISKに変えて整合性を保持
+                get_ref++;
+                if(ref->page != NULL && !__wt_page_is_modified(ref->page) && ref->page->dsk != NULL){
+                    // 検索キーを作成
+                    MIGRATION_SEARCH_ITEM search_key;
+                    search_key.ref_dsk_gva = (uintptr_t)ref->page->dsk;
+                    
+                    // 二分探索を実行
+                    MIGRATION_SEARCH_ITEM *hit = (MIGRATION_SEARCH_ITEM *)bsearch(
+                        &search_key,
+                        skip_wt_ref_list->item,
+                        skip_wt_ref_list->count,
+                        sizeof(MIGRATION_SEARCH_ITEM),
+                        compare_migration_search_item
+                    );
+
+                    // 3. ABA問題の完全防御（GVAとディスクアドレスの両方一致）
+                    if (hit != NULL && hit->ref_addr == ref->addr) {
+                        get_target_skip++;            
+                        if ((previous_state = WT_REF_GET_STATE(ref)) == WT_REF_MEM &&
+                            WT_REF_CAS_STATE(session_impl, ref, previous_state, WT_REF_LOCKED)) {
+                            evict_target = ref;
+                        }
+                    }
+                }
+                //移送対象でdirtyになったページは
+            }
+            
+            if(evict_target != NULL){
+                // 6. add_mongoDB_evict_List()を呼び出してそのページを多段構造リストとして保存
+                btree = dhandle->handle;
+                
+                WT_WITH_BTREE(session_impl, btree, {
+                    ret = __wt_evict(session_impl, evict_target, previous_state, 0);
+                });
+                if(ret == 0) success_evict++;
+                else failed_evict++;
+                evict_target = NULL;
+            }
+
+
+            // ウォーク終了後、最後に掴んでいたハザードポインタを解放する
+            if (ref != NULL) {
+                WT_TRET(__wt_page_release(session_impl, ref, walk_flags));
+            }
+        });
+        // ウォークが終わったら再び dhandle_lock を取得し、カウントを元に戻す
+        __wt_readlock(session_impl, &conn_impl->dhandle_lock);
+        __wt_atomic_sub32((uint32_t *)&dhandle->session_inuse, 1);
+
+        if ((success_evict + failed_evict) >= target_count) {
+            break;
+        }
+    }
+    
+    __wt_readunlock(session_impl, &conn_impl->dhandle_lock);
+    
+    // 8. WT_SESSIONを閉じる
+    if ((tret = __wt_session_close_internal(session_impl)) != 0 && ret == 0) ret = tret;
+    //WT_TRET(__wt_session_close_internal(session_impl));
+    outl(2, QEMU_PORT_MONGO_CMD);
+
+    migration_phase3_active = 0;
+
+    my_log("[RESULT]get ref page:%d\n",get_ref);
+    my_log("[RESULT]get target page:%d\n",get_target_skip);
+    my_log("[RESULT]ref state is WT_REF_MEM:%d\n",success_evict + failed_evict);
+    my_log("[RESULT]success evict page:%d\n",success_evict);
+    my_log("[RESULT]failed evict page:%d\n",failed_evict);
     return (ret);
 }

@@ -8857,6 +8857,8 @@ typedef enum {
 #undef __F
 
 int wt_clear_cache(WT_CONNECTION *connection);
+int __wt_migration_walk(WT_CONNECTION *connection);
+int __wt_migration_last_evict(WT_CONNECTION *connection);
 int wt_reconstruct_cache(WT_CONNECTION *connection);
 int wt_verify_reconstruction(WT_CONNECTION *connection);
 int print_reconstruct_cache(WT_CONNECTION *connection);

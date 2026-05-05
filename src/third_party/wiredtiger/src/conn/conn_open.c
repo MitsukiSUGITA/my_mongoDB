@@ -207,6 +207,12 @@ __wti_connection_close(WT_CONNECTION_IMPL *conn)
     /* Destroy any precompiled configuration. */
     __wt_conf_compile_discard(session);
 
+    //共有ビットマップのアンマップ 
+    if (conn->shared_bitmap != NULL) {
+        munmap(conn->shared_bitmap, conn->shared_bitmap_size);
+        conn->shared_bitmap = NULL;
+    }
+
     /* Destroy the handle. */
     __wti_connection_destroy(conn);
 

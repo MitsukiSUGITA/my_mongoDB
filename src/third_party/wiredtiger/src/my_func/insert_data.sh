@@ -1,12 +1,7 @@
 #!/bin/bash
 set -e # エラーが発生したら即停止
 
-# --- 引数で設定を受け取る (デフォルト値は以前の実験設定) ---
-# 第1引数: MongoDBキャッシュサイズ (GB)
-#CACHE_SIZE_GB=${1:-1} 
-# 第2引数: ドキュメント数 (1件10KB計算)
-# 例: 200,000件 ≒ 2GB, 2,500,000件 ≒ 25GB
-#INPUT_DOC_COUNT=${2:-200000}
+# --- 引数で設定を受け取る ---
 INPUT_DOC_COUNT=${1:-200000}
 
 # --- Root権限チェック ---
@@ -18,24 +13,32 @@ fi
 # ==========================================
 # 1. 設定
 # ==========================================
-# VM内のmongodへのパス
 MONGOD_BINARY="./mongod"
-# テスト用DBとログの場所
 DB_PATH="/tmp/mongo_migration_test"
 LOG_PATH="$DB_PATH/mongod.log"
 PORT=27017
 PADDING_SIZE=10240 
 
+# 🌟 改善点1: ivshmemのパスを動的に取得・設定（スキップ判定ロジック用）
+IVSHMEM_DIR=$(lspci -D -d 1af4:1110 | awk '{print $1}' | head -n 1)
+if [ -n "$IVSHMEM_DIR" ]; then
+    export WT_IVSHMEM_PATH="/sys/bus/pci/devices/${IVSHMEM_DIR}/resource2"
+    echo "✅ Found ivshmem device at: $WT_IVSHMEM_PATH"
+else
+    export WT_IVSHMEM_PATH="/sys/bus/pci/devices/0000:00:05.0/resource2"
+    echo "⚠️ Warning: ivshmem device auto-detect failed. Using default: $WT_IVSHMEM_PATH"
+fi
+
 echo "=================================================="
 echo "      MongoDB Data Insertion (Cache Warmer)       "
 echo "=================================================="
-#echo "Cache Size:  ${CACHE_SIZE_GB} GB"
 echo "Doc Count:   ${INPUT_DOC_COUNT}"
 echo "Approx Data: $(( INPUT_DOC_COUNT * PADDING_SIZE / 1024 / 1024 )) MB"
 echo "--------------------------------------------------"
 
 # ==========================================
 # [関数] キャッシュ統計を表示するヘルパー
+# (変更なし: 非常に良く書かれています)
 # ==========================================
 check_cache_stats() {
     local STEP_NAME="$1"
@@ -44,17 +47,12 @@ check_cache_stats() {
     mongosh --quiet --port "$PORT" --eval "
       try {
           const status = db.serverStatus().wiredTiger.cache;
-          
-          // 基本的なサイズ情報
           const bytes = status['bytes currently in the cache'];
           const max_bytes = status['maximum bytes configured'];
           const dirty_bytes = status['tracked dirty bytes in the cache'];
-          
-          // ページ数情報
           const pages = status['pages currently held in the cache'];
           const dirty_pages = status['tracked dirty pages in the cache'];
           
-          // 計算（MB/GB変換とパーセンテージ）
           const gb = (bytes / (1024 * 1024 * 1024)).toFixed(2);
           const max_gb = (max_bytes / (1024 * 1024 * 1024)).toFixed(2);
           const dirty_gb = (dirty_bytes / (1024 * 1024 * 1024)).toFixed(2);
@@ -79,45 +77,42 @@ check_cache_stats() {
 # ==========================================
 # 2. 環境リセット & 起動
 # ==========================================
-
 echo "--- [Step 1] 環境リセットと起動 ---"
-# 古いプロセスを停止
 killall -9 mongod 2>/dev/null || true
 
-# 古いディレクトリを削除して再作成
 rm -rf "$DB_PATH"
 mkdir -p "$DB_PATH"
 
-# デバッグログのリセット（必要であれば）
 rm -f "$DB_PATH/my_debug.log"
 touch "$DB_PATH/my_debug.log"
 chmod 777 "$DB_PATH/my_debug.log"
 
-# 🌟 追加箇所：コアダンプとtcmallocの設定
+# 🌟 改善点2: OSのページキャッシュとTHPの無効化（ノイズ排除）
+echo "OSのページキャッシュをクリアしています..."
+sync; echo 3 > /proc/sys/vm/drop_caches
+
+echo "Transparent Huge Pages (THP) を無効化しています..."
+if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
+    echo never > /sys/kernel/mm/transparent_hugepage/enabled
+fi
+if [ -f /sys/kernel/mm/transparent_hugepage/defrag ]; then
+    echo never > /sys/kernel/mm/transparent_hugepage/defrag
+fi
+
 echo "Applying Core Dump and TCMALLOC settings..."
-
-# 1. コアダンプのサイズ制限を無効化（このプロセスから派生するmongodに引き継がれる）
 ulimit -c unlimited
-
-# 2. 仮説検証: tcmallocのバックグラウンドスレッドによるメモリ解放を停止
-# これにより移行先のゼロページにアクセスしてクラッシュするのを防げるか確認する
 export TCMALLOC_RELEASE_RATE=0
 
 echo "Starting mongod..."
-# 起動 (キャッシュサイズを1GBに固定して、データがメモリに載るようにする)
 "$MONGOD_BINARY" --fork --dbpath "$DB_PATH" --logpath "$LOG_PATH" \
   --port "$PORT" --bind_ip 127.0.0.1 \
   --syncdelay 3600 \
   --wiredTigerEngineConfigString "mmap=false,checkpoint=(wait=3600),eviction_dirty_target=90,eviction_dirty_trigger=95,eviction_target=95,eviction_trigger=99"
-  #  --wiredTigerEngineConfigString "checkpoint=(wait=3600),eviction_dirty_target=90,eviction_dirty_trigger=95,eviction_target=95,eviction_trigger=99"
-#  --wiredTigerCacheSizeGB "$CACHE_SIZE_GB"
 
 sleep 5
 
-# 起動確認
 if ! pgrep -f "mongod.*$PORT" > /dev/null; then
     echo "❌ ERROR: mongod failed to start."
-    echo "--- Tail of mongod.log ---"
     tail -n 20 "$LOG_PATH"
     exit 1
 fi
@@ -126,34 +121,36 @@ echo "✅ mongod started (PID: $(pgrep -f "mongod.*$PORT"))"
 # ==========================================
 # 3. データ挿入 (キャッシュ温め)
 # ==========================================
-#echo "--- [Step 2] データ挿入 (約 $CACHE_SIZE_GB GB) ---"
+echo "--- [Step 2] データ挿入とダーティ化 ---"
 mongosh --quiet --port "$PORT" --eval "
   const db = db.getSiblingDB('test_db');
   db.my_table.drop();
-  const bulk = db.my_table.initializeUnorderedBulkOp();
+  let bulk = db.my_table.initializeUnorderedBulkOp();
   
-  // QEMUでの検証用に 'A' (0x41) で埋める
   const padding = 'A'.repeat($PADDING_SIZE); 
+  const totalDocs = $INPUT_DOC_COUNT;
 
-  print('Preparing bulk insert...');
-  for (let i = 0; i < $INPUT_DOC_COUNT; i++) {
-      bulk.insert({ 
-          _id: i, 
-          val: padding 
-      });
-      // 進捗表示
-      // if (i % 20000 == 0 && i > 0) print('  Prepared ' + i + ' documents...');
+  print('Executing bulk insert in batches...');
+  for (let i = 0; i < totalDocs; i++) {
+      bulk.insert({ _id: i, val: padding });
+      
+      // 🌟 改善点3: 1万件ごとにバッチ実行し、mongoshのOOMクラッシュを防ぐ
+      if ((i + 1) % 10000 === 0) {
+          bulk.execute();
+          print('  Inserted ' + (i + 1) + ' / ' + totalDocs + ' documents...');
+          bulk = db.my_table.initializeUnorderedBulkOp(); // バルク再初期化
+      }
   }
-  print('Executing bulk insert (this may take a while)...');
-  bulk.execute();
-  print('✅ Insert complete: $INPUT_DOC_COUNT documents.');
+  // 端数の処理
+  if (totalDocs % 10000 !== 0) {
+      bulk.execute();
+  }
+  print('✅ Insert complete: ' + totalDocs + ' documents.');
 
   print('🔄 Force-updating all documents to maximize Dirty Rate...');
-  // 全ドキュメントのフラグを書き換える
   db.my_table.updateMany({}, { \$set: { dirty_flag: 1 } });
   print('✅ Update complete.');
 "
-
 
 # 統計確認: 挿入後
 check_cache_stats "データ挿入直後 (High Cache Usage)"
@@ -164,4 +161,3 @@ echo "✅ DATA INSERTION COMPLETE"
 echo "=================================================="
 echo "MongoDBはポート $PORT で起動中です。"
 echo "キャッシュにデータが充填されました。"
-echo "次にキャッシュクリア用スクリプトを実行するか、手動でコマンドを試してください。"

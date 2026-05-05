@@ -7,11 +7,14 @@
  */
 
 #include "wt_internal.h"
+#include <dirent.h>
 
 /* 退避サーバへの一時停止「リクエスト」用フラグ (0: 動作, 1: 停止リクエスト) */
 volatile uint32_t eviction_server_pause_request = 0;
 /* 退避サーバが実際に一時停止したことを示す「状態」フラグ (0: 動作中, 1: 停止中) */
 volatile uint32_t eviction_server_is_paused = 0;
+extern volatile uint32_t eviction_pause_request;
+extern volatile uint32_t eviction_paused_count;
 
 void print_key_hex(const uint8_t *data, size_t size);
 void print_clear_page_info(WT_SESSION_IMPL *session, const char *title, WT_BTREE *btree, WT_REF *ref, int is_before);
@@ -2880,6 +2883,82 @@ __conn_version_verify(WT_SESSION_IMPL *session)
     return (0);
 }
 
+void get_shared_bitmap(WT_SESSION_IMPL *session ,WT_CONNECTION_IMPL *conn)
+{
+    DIR *dir;
+    struct dirent *entry;
+    char path[256];
+    char vendor_str[16], device_str[16];
+    int found = 0;
+    
+    // 1. PCIデバイスディレクトリを開く
+    dir = opendir("/sys/bus/pci/devices");
+    if (dir != NULL) {
+        my_log("[SHARED BIDMAP] open device directories\n");
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_name[0] == '.') continue;
+
+            memset(vendor_str, 0, sizeof(vendor_str));
+            memset(device_str, 0, sizeof(device_str));
+
+            // ベンダーIDの読み取り
+            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/vendor", entry->d_name);
+            int fd_v = open(path, O_RDONLY);
+            if (fd_v >= 0) {
+                // readはNUL終端しないため、念のためバッファをゼロクリアするか、
+                // strncmpで比較する文字数(6文字)が保証されていればOK
+                ssize_t n = read(fd_v, vendor_str, sizeof(vendor_str) - 1);
+                if (n > 0) vendor_str[n] = '\0';
+                close(fd_v);
+            }
+
+            // デバイスIDの読み取り
+            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/device", entry->d_name);
+            int fd_d = open(path, O_RDONLY);
+            if (fd_d >= 0) {
+                ssize_t n = read(fd_d, device_str, sizeof(device_str) - 1);
+                if (n > 0) device_str[n] = '\0';
+                close(fd_d);
+            }
+
+            // 2. IVSHMEM (1af4:1110) か判定
+            if (strncmp(vendor_str, "0x1af4", 6) == 0 && strncmp(device_str, "0x1110", 6) == 0) {
+                snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource2", entry->d_name);
+                found = 1;
+                break;
+            }
+        }
+        closedir(dir);
+    }
+
+    if (found) {
+        int fd = open(path, O_RDWR);
+        if (fd >= 0) {
+            struct stat st;
+            // ファイル（PCIリソース）の情報を取得
+            if (fstat(fd, &st) == 0) {
+                // OSが認識しているサイズをそのまま使う！
+                conn->shared_bitmap_size = st.st_size; 
+                
+                conn->shared_bitmap = mmap(NULL, conn->shared_bitmap_size, 
+                                        PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                close(fd);
+                
+                if (conn->shared_bitmap != NULL && conn->shared_bitmap != MAP_FAILED) {
+                    __wt_verbose_info(session, WT_VERB_RECOVERY, 
+                        "IVSHMEM mapped at %s (Size: %zu bytes)", path, conn->shared_bitmap_size);
+                } else {
+                    conn->shared_bitmap = NULL;
+                    __wt_err(session, errno, "IVSHMEM mmap failed");
+                }
+            } else {
+                close(fd);
+                __wt_err(session, errno, "IVSHMEM fstat failed");
+            }
+        }
+    }
+}
+
 /*
  * wiredtiger_open --
  *     Main library entry point: open a new connection to a WiredTiger database.
@@ -2941,6 +3020,8 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
     /* Initialize the fake session used until we can create real sessions. */
     wiredtiger_dummy_session_init(conn, event_handler);
     session = conn->default_session = &conn->dummy_session;
+
+    get_shared_bitmap(session, conn);
 
     /* Basic initialization of the connection structure. */
     WT_ERR(__wti_connection_init(conn));
@@ -3433,34 +3514,59 @@ void print_key_hex(const uint8_t *data, size_t size) {
     }
 }
 
-/* 退避サーバを一時停止させ、実際に停止するまで待機するAPI */
+/* 退避サーバ群を一時停止させ、アクティブな全スレッドが停止するまで待機するAPI */
 int wt_pause_eviction_server(WT_CONNECTION *connection) {
-    int timeout_ms = 5000; // 最大5秒待つ
     (void)connection;
 
-    /* 1. まず、「停止中」フラグをクリアしておく */
-    __wt_atomic_store32((uint32_t *)&eviction_server_is_paused, 0);
+    // すでにリクエスト済みなら何もしない（二重呼び出し防止）
+    if (__wt_atomic_load32((uint32_t *)&eviction_pause_request) == 1) {
+        return (0);
+    }
 
-    /* 2. 次に、サーバに「停止リクエスト」を送る */
-    __wt_atomic_store32((uint32_t *)&eviction_server_pause_request, 1);
+    /* 1. サーバ群に「停止リクエスト」を送る */
+    __wt_atomic_store32((uint32_t *)&eviction_pause_request, 1);
 
-    /* 3. サーバが「停止中」フラグを立てるまで待機する */
-    while (__wt_atomic_load32((uint32_t *)&eviction_server_is_paused) == 0) {
+    /* 2. アクティブなスレッドが全て関所に到達するのを待つ */
+    int timeout_ms = 5000;
+    int stable_count = 0;
+    uint32_t last_count = 0;
+
+    usleep(20 * 1000); // 20ms: 最初のアクティブスレッドがトラップされるための初期猶予
+
+    while (timeout_ms > 0) {
+        uint32_t current = __wt_atomic_load32((uint32_t *)&eviction_paused_count);
+        
+        // 活動中のスレッドが次々とトラップされると current は増える。
+        // 一定時間(30ms)変動しなくなったら、すべてのアクティブスレッドがトラップ完了とみなす。
+        if (current == last_count) {
+            stable_count++;
+            if (stable_count >= 3) break; // 完全に静止した
+        } else {
+            stable_count = 0;
+            last_count = current;
+        }
         usleep(10 * 1000);
         timeout_ms -= 10;
-        if (timeout_ms <= 0) {
-            fprintf(stderr, "Timeout waiting for eviction server to pause.\n");
-            return (ETIMEDOUT);
-        }
+    }
+
+    if (timeout_ms <= 0) {
+        fprintf(stderr, "[WT-MIG] Timeout waiting for eviction servers to pause.\n");
+        return (ETIMEDOUT);
     }
     return (0);
 }
 
-/* 退避サーバを再開させるAPI */
+/* 退避サーバ群を再開させるAPI */
 int wt_resume_eviction_server(WT_CONNECTION *connection) {
     (void)connection;
-    /* サーバへの「停止リクエスト」を解除する */
-    __wt_atomic_store32((uint32_t *)&eviction_server_pause_request, 0);
+    
+    /* 停止リクエストを解除 */
+    __wt_atomic_store32((uint32_t *)&eviction_pause_request, 0);
+    
+    // 全スレッドが完全にトラップから抜けるのを確認する（安全装置）
+    while (__wt_atomic_load32((uint32_t *)&eviction_paused_count) > 0) {
+        usleep(1000);
+    }
     return (0);
 }
 

@@ -28,9 +28,13 @@ __wt_page_modify_alloc(WT_SESSION_IMPL *session, WT_PAGE *page)
      * structure is used, update the page's memory footprint, else discard the modify structure,
      * another thread did the work.
      */
-    if (__wt_atomic_cas_ptr(&page->modify, NULL, modify))
+    if (__wt_atomic_cas_ptr(&page->modify, NULL, modify)) {
         __wt_cache_page_inmem_incr(session, page, sizeof(*modify), false);
-    else
+        
+        if (page->mig_pfn_cnt > 0) 
+            update_migration_bitmap((WT_CONNECTION *)S2C(session), page, 0);
+        
+    } else
 err:
         __wt_free(session, modify);
     return (ret);

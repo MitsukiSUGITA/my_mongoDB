@@ -888,6 +888,10 @@ struct __wt_page {
 
     WT_PAGE_BLOCK_META block_meta;
 
+#define WT_MIG_MAX_PFNS 32
+    uint64_t mig_pfns[WT_MIG_MAX_PFNS];
+    uint16_t mig_pfn_cnt; /* wtmig_pfns配列の要素数 (2 bytes) */
+
 #ifdef HAVE_DIAGNOSTIC
 #define WT_SPLIT_SAVE_STATE_MAX 3
     WT_SPLIT_PAGE_HIST split_hist[WT_SPLIT_SAVE_STATE_MAX];

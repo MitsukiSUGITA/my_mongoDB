@@ -244,7 +244,6 @@ __wt_strndup(WT_SESSION_IMPL *session, const void *str, size_t len, void *retp)
     return (0);
 }
 
-extern int migration_phase3_active;
 /*
  * __wt_free_int --
  *     ANSI free function.
@@ -258,17 +257,6 @@ __wt_free_int(WT_SESSION_IMPL *session, const void *p_arg)
     p = *(void **)p_arg;
     if (p == NULL) /* ANSI C free semantics */
         return;
-
-    if(migration_phase3_active == 1){
-        // 1. ポインタに割り当てられているメモリの全体サイズを取得する
-        size_t alloc_size = malloc_usable_size(p);
-        
-        // 2. TCMallocが次ポインタ(8バイト)を書き込むスペースを残し、残りを0x00で埋める
-        // ※ 念のため、16バイト以上の割り当ての時だけ実行するようにする
-        if (alloc_size > 16) {
-            memset((uint8_t *)p + 8, 0x00, alloc_size - 8);
-        }
-    }
 
     /*
      * If there's a serialization bug we might race with another thread. We can't avoid the race

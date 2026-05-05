@@ -518,6 +518,19 @@ skip_evict:
                     session->pf.prefetch_disk_read_count = 0;
             }
 
+
+            // 移送中 (1, 2, 3) であり、かつディスクから読んだ場合
+            if (wt_migration_state == 1 && read_from_disk && page->dsk != NULL) {
+                WT_PAGE *page = ref->page;
+
+                // 1. PFNの計算と配列確保 (ページインした「最初の1回」だけシステムコールが走る)
+                // ※ すでに計算済みのページなら、関数内部の NULLチェックで即座に脱出するので安全
+                set_wt_page_pfn_array(page);
+
+                // 2. KVMのDirty誤判定を上書きし、ビットを 1 (Clean) にする
+                update_migration_bitmap((WT_CONNECTION *)S2C(session), page, 1);
+            }
+
             __wt_evict_touch_page(session, page, LF_ISSET(WT_READ_INTERNAL_OP), wont_need);
 
             /*

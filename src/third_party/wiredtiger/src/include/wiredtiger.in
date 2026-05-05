@@ -8868,6 +8868,23 @@ int wt_dump_pages_from_refs(WT_CONNECTION *connection);
 int wt_pause_eviction_server(WT_CONNECTION *connection);
 int wt_resume_eviction_server(WT_CONNECTION *connection);
 int wt_print_eviction_thread_status(WT_CONNECTION *connection);
+void my_log(const char *format, ...);
+uint64_t GVA_to_PFN(void *vaddr);
+
+// 外部に定義している状態変数（すでに存在している前提）
+extern volatile int wt_migration_state;
+// マイグレーションを実行するスレッドを識別するための変数（新設）
+extern volatile pthread_t wt_migration_thread_id; 
+
+// 他のワーカースレッドを足止めするバリアマクロ
+#define WT_MIGRATION_BARRIER() \
+    do { \
+        /* 状態が2(ダウンタイム)以上かつ、自分がマイグレーションスレッドでない場合 */ \
+        while (wt_migration_state >= 2 && pthread_self() != wt_migration_thread_id) { \
+            usleep(1000); /* 1ミリ秒スリープして待機し続ける */ \
+        } \
+    } while(0)
+
 typedef struct {
     char     uri[256];         /* テーブル名 (URI) */
     uint64_t parent_page_addr; /* 親ページのメモリアドレス (親子関係の識別に使う) */
@@ -8880,6 +8897,11 @@ typedef struct {
 } CACHE_PAGE_INFO;
 
 typedef struct __wt_ref WT_REF;
+typedef struct __wt_page WT_PAGE;
+
+extern volatile int wt_migration_state;
+void set_wt_page_pfn_array(WT_PAGE *page);
+void update_migration_bitmap(WT_CONNECTION *connection, WT_PAGE *page, int is_clean);
 
 /* ページ参照とその所属テーブル(dhandle)をペアで保持する構造体 */
 typedef struct {

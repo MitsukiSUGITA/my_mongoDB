@@ -525,7 +525,7 @@ skip_evict:
 
                 // 1. PFNの計算と配列確保 (ページインした「最初の1回」だけシステムコールが走る)
                 // ※ すでに計算済みのページなら、関数内部の NULLチェックで即座に脱出するので安全
-                set_wt_page_pfn_array(page);
+                populate_page_pfn_array(page);
 
                 // 2. KVMのDirty誤判定を上書きし、ビットを 1 (Clean) にする
                 update_migration_bitmap((WT_CONNECTION *)S2C(session), page, 1);

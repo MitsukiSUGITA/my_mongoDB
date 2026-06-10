@@ -79,6 +79,9 @@ static int g_pagemap_fd = -1;
 static mongoDB_evict_List evict_list __attribute__((aligned(4096)));
 static pthread_mutex_t qemu_lock = PTHREAD_MUTEX_INITIALIZER;
 
+extern void mongo_acquire_global_migration_lock(void) __attribute__((weak)); // グローバルな移行ロックを獲得する関数
+extern void mongo_release_global_migration_lock(void) __attribute__((weak)); // グローバルな移行ロックを解放する関数
+
 static int __evict_clear_all_walks_and_saved_tree(WT_SESSION_IMPL *);
 static void __evict_list_clear_page_locked(WT_SESSION_IMPL *, WT_REF *, bool);
 static int WT_CDECL __evict_lru_cmp(const void *, const void *);
@@ -4156,7 +4159,10 @@ static void* qemu_monitor_thread(void *arg) {
             
             // ★ ここで初めてバリアを解除し、凍結していたスレッドたちを解放する
             wt_migration_state = 0; 
-            
+            if (mongo_release_global_migration_lock != NULL) {
+                mongo_release_global_migration_lock();
+            }
+
             // エビクションサーバーもここで再開する
             wt_resume_eviction_server(conn);
         }
@@ -4393,7 +4399,6 @@ uint64_t GVA_to_PFN(void *vaddr) {
     return pfn_item & ((1ULL << 55) - 1);
 }
 
-int clean_page;
 void update_migration_bitmap(WT_CONNECTION *connection, WT_PAGE *page, int is_clean) {
     if (page == NULL || connection == NULL) return;
     
@@ -4499,11 +4504,10 @@ __wt_migration_walk(WT_CONNECTION *connection)
     WT_DATA_HANDLE *dhandle;
     WT_REF *ref;
     uint32_t walk_flags = WT_READ_CACHE | WT_READ_RESTART_OK |
-                      WT_READ_VISIBLE_ALL | WT_READ_SKIP_INTL | WT_READ_NO_WAIT;
+                      WT_READ_VISIBLE_ALL | WT_READ_NO_WAIT;
 
     int dbg_total_walked = 0;
     int dbg_clean_found = 0;
-    clean_page = 0;
     
     wt_migration_state = 1;
 
@@ -4590,8 +4594,7 @@ __wt_migration_walk(WT_CONNECTION *connection)
                                 ref->page->type == WT_PAGE_COL_FIX);
                 
                 // LeafページかつCleanでスキップできるか判定
-                if (is_leaf && !__wt_page_is_modified(ref->page) && 
-                    ref->addr != NULL && ref->page->dsk != NULL) {  // addr != NULL を追加
+                if (is_leaf && !__wt_page_is_modified(ref->page) && ref->addr != NULL ) {
                     dbg_clean_found++; 
                     set_wt_page_pfn_array(ref->page);
                     update_migration_bitmap(connection, ref->page, 1);
@@ -4619,33 +4622,9 @@ __wt_migration_walk(WT_CONNECTION *connection)
 
     my_log("[DEBUG Phase1] Total pages walked: %d\n", dbg_total_walked);
     my_log("[DEBUG Phase1] Clean pages found: %d\n", dbg_clean_found);
-    my_log("[DEBUG Phase1] Actually Clean pages: %d\n", clean_page);
     outl(2, QEMU_PORT_MONGO_CMD);
 
     return (ret);
-}
-
-/*
- * ページがPhase1によって「スキップ対象(1)」に設定されているか確認する関数。
- * static inline にすることで、関数呼び出しのオーバーヘッドをゼロ（展開）にします。
- */
-static inline int is_page_skipped(WT_CONNECTION *connection, WT_PAGE *page) {
-    WT_CONNECTION_IMPL *conn = (WT_CONNECTION_IMPL *)connection;
-    
-    // 安全装置
-    if (page == NULL || conn->shared_bitmap == NULL || page->mig_pfn_cnt == 0) {
-        return 0; 
-    }
-
-    uint8_t *bitmap = (uint8_t *)conn->shared_bitmap;
-    uint64_t pfn = page->mig_pfns[0]; // ページ内の全PFNは状態が共通なので[0]で判定
-    
-    uint64_t byte_idx = pfn / 8;
-    uint8_t bit_mask = 1 << (pfn % 8);
-
-    // ビットが立っている(1)かどうかを判定
-    // (bitmap[byte_idx] & bit_mask) が 0 でなければ、スキップ対象(1)であると判断
-    return (bitmap[byte_idx] & bit_mask) ? 1 : 0;
 }
 
 int dbg_phase3_evict_total = 0;
@@ -4692,7 +4671,11 @@ int __wt_migration_last_evict(WT_CONNECTION *connection) {
 
     conn_impl = (WT_CONNECTION_IMPL *)connection;
 
-    // ★ スキップの亡霊をリセット
+    // トラフィックの完全遮断 (YCSBのクエリが静まるまでブロックされる)
+    if (mongo_acquire_global_migration_lock != NULL) {
+        mongo_acquire_global_migration_lock();
+    }
+
     if (conn_impl->shared_bitmap != NULL) {
         memset(conn_impl->shared_bitmap, 0, conn_impl->shared_bitmap_size);
     }
@@ -4715,7 +4698,7 @@ int __wt_migration_last_evict(WT_CONNECTION *connection) {
         __wt_atomic_add32((uint32_t *)&dhandle->session_inuse, 1);
         __wt_readunlock(walk_session, &conn_impl->dhandle_lock);
 
-        // ★ 遅延フラッシュ用の動的配列（1ツリー最大100万ページまで許容）
+        // 遅延フラッシュ用の動的配列（1ツリー最大100万ページまで許容）
         int tree_capacity = 100000;
         WT_REF **tree_evict_array = malloc(tree_capacity * sizeof(WT_REF*));
         int tree_evict_cnt = 0;
@@ -4763,56 +4746,58 @@ int __wt_migration_last_evict(WT_CONNECTION *connection) {
                                 ref->page->type == WT_PAGE_COL_VAR || 
                                 ref->page->type == WT_PAGE_COL_FIX);
                 
-                // ★ 厳格なクリーン判定（BSONError防止）
                 bool is_strictly_clean = !__wt_page_is_modified(ref->page) && (ref->page->modify == NULL);
 
                 if (is_leaf && is_strictly_clean && ref->addr != NULL && ref->page->dsk != NULL) {
                     evict_state = WT_REF_GET_STATE(ref);
                     
-                    if (evict_state == WT_REF_MEM && WT_REF_CAS_STATE(walk_session, ref, evict_state, WT_REF_LOCKED)) {
-                        
-                        // ハザードチェック
-                        if (__wt_hazard_check(walk_session, ref, NULL) != NULL) {
-                            WT_REF_CAS_STATE(walk_session, ref, WT_REF_LOCKED, WT_REF_MEM);
-                            force_kvm_dirty_dsk(ref->page); // 諦めた分は強制転送
-                        } else {
-                            // 安全確認完了！ロックしたまま配列に積む
-                            if (tree_evict_cnt >= tree_capacity) {
-                                tree_capacity *= 2;
-                                tree_evict_array = realloc(tree_evict_array, tree_capacity * sizeof(WT_REF*));
-                            }
-                            tree_evict_array[tree_evict_cnt++] = ref;
-                            ref = NULL;
+                    if (evict_state == WT_REF_MEM) {
+                        if (tree_evict_cnt >= tree_capacity) {
+                            tree_capacity *= 2;
+                            tree_evict_array = realloc(tree_evict_array, tree_capacity * sizeof(WT_REF*));
                         }
+                        tree_evict_array[tree_evict_cnt++] = ref;
                     }
                 } else {
                     if (!is_leaf) count_line4_internal++;
                     else count_line3_dirty++;
                 }
             } // while(1) 終了
-        }); 
-        });
 
         // ========================================================
         // STEP 2: 遅延フラッシュ（ツリー探索が完全に終わった後）
         // ========================================================
-        // ここでは __wt_tree_walk は一切動いていないため、0x10の自爆は絶対に起きない！
         for (int i = 0; i < tree_evict_cnt; i++) {
             WT_REF *target = tree_evict_array[i];
             
-            //set_wt_page_pfn_array(target->page);
-            
-            // 1. スキップ登録
-            //update_migration_bitmap(connection, target->page, 1);
+            // 1. 状態がMEMでなければスキップ
+            if (WT_REF_GET_STATE(target) != WT_REF_MEM) continue;
 
-            // 2. ポインタを安全に破壊
-            //target->page = NULL;
+            // 2. CASの実行
+            bool cas_success = WT_REF_CAS_STATE(evict_session, target, WT_REF_MEM, WT_REF_LOCKED);
             
-            // 3. 状態を DISK にすり替える
-            WT_REF_CAS_STATE(evict_session, target, WT_REF_LOCKED, WT_REF_DISK);
-            
-            dbg_phase3_evict_success++;
+            if (cas_success) {
+                // 3. ハザードチェックの実行（ここで落ちるか？）
+                // ※ walk_session ではなく、CASを行った evict_session に統一します
+                void *hazard_res = __wt_hazard_check(evict_session, target, NULL);
+
+                if (hazard_res != NULL) {
+                    WT_REF_CAS_STATE(evict_session, target, WT_REF_LOCKED, WT_REF_MEM);
+                    force_kvm_dirty_dsk(target->page); 
+                } else {                    
+                    target->page = NULL;
+                    WT_REF_CAS_STATE(evict_session, target, WT_REF_LOCKED, WT_REF_DISK);
+                    
+                    volatile uint8_t *dirty_ptr = (volatile uint8_t *)target;
+                    *dirty_ptr = *dirty_ptr; 
+                    
+                    dbg_phase3_evict_success++;
+                }
+            }
         }
+
+        }); 
+        });
 
         // 動的配列の解放
         free(tree_evict_array);

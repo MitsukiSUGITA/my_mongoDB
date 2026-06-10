@@ -3085,3 +3085,48 @@ WiredTigerKVEngineBase::WiredTigerConfig getWiredTigerConfigFromStartupOptions()
 }
 
 }  // namespace mongo
+
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h" // getGlobalServiceContext() を使うため
+#include "mongo/db/concurrency/d_concurrency.h"
+
+static mongo::ServiceContext::UniqueOperationContext g_migration_opCtx;
+static std::unique_ptr<mongo::Lock::GlobalWrite> g_migration_lock;
+
+#include <cstdio>
+#include <cstdarg>
+
+extern "C" {
+
+// マイグレーション開始時にYCSBをドレイン・遮断する関数
+void mongo_acquire_global_migration_lock() {
+    using namespace mongo;
+
+    // 現在のスレッドがMongoDBのClientとして認識されていない場合は初期化
+    if (!haveClient()) {
+        Client::initThread("MigrationBarrierThread", getGlobalServiceContext()->getService());
+    }
+
+    // オペレーションコンテキストの作成
+    g_migration_opCtx = cc().makeOperationContext();
+
+    // ここで強力なグローバル排他ロックを取得
+    // YCSBのRead/Writeが実行中の場合は完了まで待機し、取得後は新規のクエリをすべてブロックさせる
+    auto start = std::chrono::steady_clock::now();
+    g_migration_lock = std::make_unique<Lock::GlobalWrite>(g_migration_opCtx.get());
+    auto end = std::chrono::steady_clock::now();
+    my_log("[MONGO-BRIDGE] GlobalWrite Lock acquired. All traffic stopped. Time taken to acquire lock: %ld milliseconds\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+}
+
+// 移送先さきで再開させるときの解放関数
+void mongo_release_global_migration_lock() {
+    using namespace mongo;
+    if (g_migration_lock) {
+        g_migration_lock.reset();
+        g_migration_opCtx.reset();
+        my_log("[MONGO-BRIDGE] GlobalWrite Lock released.\n");
+    }
+}
+
+} // extern "C"

@@ -23,7 +23,6 @@ __thread_run(void *arg)
     session = thread->session;
 
     for (;;) {
-        WT_MIGRATION_BARRIER();
         if (!F_ISSET(thread, WT_THREAD_RUN))
             break;
         if (!F_ISSET(thread, WT_THREAD_ACTIVE))

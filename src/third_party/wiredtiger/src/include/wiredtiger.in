@@ -8876,15 +8876,6 @@ extern volatile int wt_migration_state;
 // マイグレーションを実行するスレッドを識別するための変数（新設）
 extern volatile pthread_t wt_migration_thread_id; 
 
-// 他のワーカースレッドを足止めするバリアマクロ
-#define WT_MIGRATION_BARRIER() \
-    do { \
-        /* 状態が2(ダウンタイム)以上かつ、自分がマイグレーションスレッドでない場合 */ \
-        while (wt_migration_state >= 2 && pthread_self() != wt_migration_thread_id) { \
-            usleep(1000); /* 1ミリ秒スリープして待機し続ける */ \
-        } \
-    } while(0)
-
 typedef struct {
     char     uri[256];         /* テーブル名 (URI) */
     uint64_t parent_page_addr; /* 親ページのメモリアドレス (親子関係の識別に使う) */

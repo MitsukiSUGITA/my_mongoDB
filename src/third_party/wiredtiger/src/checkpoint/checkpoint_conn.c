@@ -87,7 +87,6 @@ __ckpt_server(void *arg)
     wt_session = (WT_SESSION *)session;
 
     for (;;) {
-        WT_MIGRATION_BARRIER();
         /*
          * Wait... NOTE: If the user only configured logsize, then usecs will be 0 and this wait
          * won't return until signalled.

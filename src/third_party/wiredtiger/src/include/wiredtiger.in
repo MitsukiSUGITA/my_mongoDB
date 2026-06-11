@@ -8855,20 +8855,6 @@ typedef enum {
 /*! @} */
 
 #undef __F
-// 外部に定義している状態変数（すでに存在している前提）
-extern volatile int wt_migration_state;
-
-typedef struct __wt_ref WT_REF;
-typedef struct __wt_page WT_PAGE;
-
-void my_log(const char *format, ...);
-uint64_t vaddr_to_pfn(void *vaddr);
-void populate_page_pfn_array(WT_PAGE *page);
-void update_migration_bitmap(WT_CONNECTION *connection, WT_PAGE *page, int is_clean);
-extern void mongo_acquire_global_migration_lock(void) __attribute__((weak)); // グローバルな移行ロックを獲得する関数
-extern void mongo_release_global_migration_lock(void) __attribute__((weak)); // グローバルな移行ロックを解放する関数
-int __wt_migration_set_skippages_bitmap(WT_CONNECTION *connection);
-int __wt_migration_mark_clean_pages_dsk(WT_CONNECTION *connection);
 
 #if defined(__cplusplus)
 }

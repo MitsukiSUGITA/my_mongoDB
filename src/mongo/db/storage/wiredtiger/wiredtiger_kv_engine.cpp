@@ -3099,6 +3099,27 @@ static std::unique_ptr<mongo::Lock::GlobalWrite> g_migration_lock;
 
 extern "C" {
 
+static void my_log(const char *format, ...) {
+    static FILE *fp = nullptr;
+    static int init_failed = 0;
+
+    if (init_failed) return;
+
+    if (fp == nullptr) {
+        fp = fopen("/dev/ttyS0", "a");
+        if (fp == nullptr) {
+            init_failed = 1;
+            return;
+        }
+        setvbuf(fp, nullptr, _IONBF, 0);
+    }
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(fp, format, args);
+    va_end(args);
+}
+
 // マイグレーション開始時にYCSBをドレイン・遮断する関数
 void mongo_acquire_global_migration_lock() {
     using namespace mongo;

@@ -7,7 +7,6 @@
  */
 
 #include "wt_internal.h"
-#include <dirent.h>
 
 /*
  * ext_collate --
@@ -2868,98 +2867,6 @@ __conn_version_verify(WT_SESSION_IMPL *session)
 }
 
 /*
- * get_shared_bitmap --
- * ゲストOSのPCIバスをスキャンして QEMU IVSHMEM デバイスを特定し、
- * マイグレーションの転送状態を同期するための共有メモリをマッピングする関数。
- */
-void get_shared_bitmap(WT_SESSION_IMPL *session ,WT_CONNECTION_IMPL *conn) {
-    DIR *dir;
-    struct dirent *entry;
-    char path[256];
-    char vendor_str[16], device_str[16];
-    int found = 0;
-    
-    int fd_v, fd_d, fd;
-    ssize_t n;
-    struct stat st;
-
-    // 1. PCIデバイスディレクトリを開き、デバイスを列挙する
-    dir = opendir("/sys/bus/pci/devices");
-    if (dir != NULL) {
-        my_log("[SHARED BITMAP] Scanning PCI devices for IVSHMEM...\n");
-        
-        while ((entry = readdir(dir)) != NULL) {
-            if (entry->d_name[0] == '.') continue;
-
-            memset(vendor_str, 0, sizeof(vendor_str));
-            memset(device_str, 0, sizeof(device_str));
-
-            // ベンダーIDの読み取り
-            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/vendor", entry->d_name);
-            fd_v = open(path, O_RDONLY);
-            if (fd_v >= 0) {
-                n = read(fd_v, vendor_str, sizeof(vendor_str) - 1);
-                if (n > 0) vendor_str[n] = '\0';
-                close(fd_v);
-            }
-
-            // デバイスIDの読み取り
-            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/device", entry->d_name);
-            fd_d = open(path, O_RDONLY);
-            if (fd_d >= 0) {
-                n = read(fd_d, device_str, sizeof(device_str) - 1);
-                if (n > 0) device_str[n] = '\0';
-                close(fd_d);
-            }
-
-            // 2. QEMU IVSHMEM デバイス (Vendor: 0x1af4, Device: 0x1110) か判定
-            if (strncmp(vendor_str, "0x1af4", 6) == 0 && strncmp(device_str, "0x1110", 6) == 0) {
-                // IVSHMEMの共有メモリ領域は通常 BAR2 (resource2) に割り当てられる
-                snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource2", entry->d_name);
-                found = 1;
-                break;
-            }
-        }
-        closedir(dir);
-    }
-
-    // 3. 対象デバイスが見つかった場合、メモリマッピング(mmap)を実行
-    if (found) {
-        fd = open(path, O_RDWR);
-        if (fd >= 0) {
-            // ファイル（PCIリソース）の情報を取得
-            if (fstat(fd, &st) == 0) {
-                // OSが認識しているサイズをそのままビットマップのサイズとして採用
-                conn->shared_bitmap_size = st.st_size; 
-                
-                // 共有メモリとしてプロセスのアドレス空間にマッピング
-                conn->shared_bitmap = mmap(NULL, conn->shared_bitmap_size, 
-                                           PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-                close(fd);
-                
-                if (conn->shared_bitmap != NULL && conn->shared_bitmap != MAP_FAILED) {
-                    __wt_verbose_info(session, WT_VERB_RECOVERY, 
-                        "IVSHMEM mapped at %s (Size: %zu bytes)", path, conn->shared_bitmap_size);
-                    my_log("[SHARED BITMAP] Successfully mapped IVSHMEM. Size: %zu bytes\n", conn->shared_bitmap_size);
-                } else {
-                    conn->shared_bitmap = NULL;
-                    __wt_err(session, errno, "IVSHMEM mmap failed");
-                    my_log("[SHARED BITMAP ERROR] mmap failed (errno: %d)\n", errno);
-                }
-            } else {
-                close(fd);
-                __wt_err(session, errno, "IVSHMEM fstat failed");
-                my_log("[SHARED BITMAP ERROR] fstat failed (errno: %d)\n", errno);
-            }
-        } else {
-            my_log("[SHARED BITMAP ERROR] Failed to open %s\n", path);
-        }
-    } else {
-        my_log("[SHARED BITMAP ERROR] IVSHMEM device (1af4:1110) not found on PCI bus.\n");
-    }
-}
-
-/*
  * wiredtiger_open --
  *     Main library entry point: open a new connection to a WiredTiger database.
  */
@@ -3021,7 +2928,7 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
     wiredtiger_dummy_session_init(conn, event_handler);
     session = conn->default_session = &conn->dummy_session;
 
-    get_shared_bitmap(session, conn);
+    __wt_migration_init_shared_bitmap(session, conn);
 
     /* Basic initialization of the connection structure. */
     WT_ERR(__wti_connection_init(conn));

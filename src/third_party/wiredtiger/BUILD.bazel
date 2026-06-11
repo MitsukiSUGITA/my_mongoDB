@@ -138,6 +138,7 @@ mongo_cc_library(
         "ext/compressors/snappy/snappy_compress.c",
         "ext/compressors/zlib/zlib_compress.c",
         "ext/compressors/zstd/zstd_compress.c",
+        "src/conn/conn_migration.c", # 移送用のファイルのパスを追記
     ] + select({
         "//bazel/config:posix": WT_FILELIST_POSIX_HOST,
         "@platforms//os:windows": [file for file in WT_FILELIST_WINDOWS_HOST if file != "src/os_win/os_futex.c"],

@@ -568,10 +568,7 @@ typedef uint64_t wt_timestamp_t;
 #include "version.h" /* required by connection.h */
 #include "connection.h"
 
-/* Custom global variable for eviction server control */
-extern volatile uint32_t eviction_server_pause_request;
-extern volatile uint32_t eviction_server_is_paused;
-
+#include "migration.h"
 #include "extern.h"
 #ifdef _WIN32
 #include "extern_win.h"

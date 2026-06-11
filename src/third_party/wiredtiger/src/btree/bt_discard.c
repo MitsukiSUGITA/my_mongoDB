@@ -100,6 +100,11 @@ __wt_page_out(WT_SESSION_IMPL *session, WT_PAGE **pagep)
         (void)S2BT(session)->bm->map_discard(
           S2BT(session)->bm, session, dsk, (size_t)dsk->mem_size);
 
+    if (page->mig_pfn_cnt > 0) {
+        update_migration_bitmap((WT_CONNECTION *)S2C(session), page, 0);
+        page->mig_pfn_cnt = 0;
+    }
+
     /*
      * If discarding the page as part of process exit, the application may configure to leak the
      * memory rather than do the work.

@@ -837,6 +837,9 @@ struct __wt_connection_impl {
 #define WT_CONN_WAS_BACKUP 0x20000000u
     /* AUTOMATIC FLAG VALUE GENERATION STOP 32 */
     wt_shared uint32_t flags;
+    char    *shm_path;           /* 共有メモリのパス */
+    void    *shared_bitmap;      /* 共有ビットマップの先頭アドレス */
+    size_t   shared_bitmap_size; /* 共有メモリのサイズ (8MB) */
 };
 
 /*

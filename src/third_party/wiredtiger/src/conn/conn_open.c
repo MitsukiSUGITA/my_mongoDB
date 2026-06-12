@@ -207,6 +207,12 @@ __wti_connection_close(WT_CONNECTION_IMPL *conn)
     /* Destroy any precompiled configuration. */
     __wt_conf_compile_discard(session);
 
+    //共有ビットマップのアンマップ 
+    if (conn->shared_bitmap != NULL) {
+        munmap(conn->shared_bitmap, conn->shared_bitmap_size);
+        conn->shared_bitmap = NULL;
+    }
+
     /* Destroy the handle. */
     __wti_connection_destroy(conn);
 
@@ -291,8 +297,7 @@ __wti_connection_workers(WT_SESSION_IMPL *session, const char *cfg[])
     __wt_verbose_info(
       session, WT_VERB_RECOVERY, "%s", "WiredTiger utility threads started successfully");
 
-    // ★追加: QEMU監視スレッドの起動(session->iface.connection で WT_CONNECTION* を取得して渡す)
-    start_qemu_monitor((WT_CONNECTION *)S2C(session));
+    start_qemu_monitor((WT_CONNECTION *)S2C(session)); // QEMU監視スレッドの起動(session->iface.connection で WT_CONNECTION* を取得して渡す)
 
     return (0);
 }

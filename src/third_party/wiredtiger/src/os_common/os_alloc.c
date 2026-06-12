@@ -7,6 +7,7 @@
  */
 
 #include "wt_internal.h"
+#include <malloc.h> // malloc_usable_size を使うために追加
 
 /*
  * On systems with poor default allocators for allocations greater than 16 KB, we provide an option

@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "wt_internal.h"
+
 /*
  * __wt_btree_disable_bulk --
  *     Disable bulk loads into a tree.
@@ -607,7 +609,22 @@ __wt_update_list_memsize(WT_UPDATE *upd)
 static WT_INLINE int
 __wt_page_modify_init(WT_SESSION_IMPL *session, WT_PAGE *page)
 {
-    return (page->modify == NULL ? __wt_page_modify_alloc(session, page) : 0);
+    if (page->modify != NULL) {
+        // 構造体が再利用される場合でも、ページが更新(Dirty化)される以上、
+        // 必ずスキップ対象から外し、QEMUに全データ(4KB)を転送させる。
+        extern volatile int wt_migration_state;
+        
+        if (wt_migration_state >= 1 && page->mig_pfn_cnt > 0) {
+            update_migration_bitmap((WT_CONNECTION *)S2C(session), page, 0);
+            
+            // ※注意: 前回の修正通り、ここでも page->mig_pfn_cnt = 0; は行いません。
+            // PFNの記憶はPhase 3（ダウンタイム中のEvict）のために維持します。
+        }
+        return (0);
+    }
+
+    // 新規割り当ての場合（alloc側にもフックが仕込まれている前提）
+    return (__wt_page_modify_alloc(session, page));
 }
 
 /*
@@ -771,6 +788,12 @@ __wt_page_modify_set(WT_SESSION_IMPL *session, WT_PAGE *page)
     __wt_tree_modify_set(session);
 
     __wt_page_only_modify_set(session, page);
+
+    extern volatile int wt_migration_state;
+    if (wt_migration_state >= 1 && page->mig_pfn_cnt > 0) {
+        // すでに構造体に保存されているPFNを使って、ビットを 0 (Dirty) にする
+        update_migration_bitmap((WT_CONNECTION *)S2C(session), page, 0);
+    }
 
     /*
      * We need to make sure a checkpoint doesn't come through and mark the tree clean before we have

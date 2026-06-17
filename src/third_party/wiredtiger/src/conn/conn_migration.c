@@ -24,8 +24,8 @@
 // =========================================================================
 // 2. QEMU 連携用 I/Oポート定義 (QEMU Communication Ports)
 // =========================================================================
-#define QEMU_PORT_MONGO_CMD  0x1241  // QEMUからのコマンドを受信するポート
-#define QEMU_PORT_MONGO_DONE 0x1243  // QEMUへ処理完了を通知するポート
+// QEMUとの双方向通信用統合ポート (Read:コマンド受信, Write:状態通知)
+#define QEMU_PORT_MONGO_CMD  0x1241
 
 // =========================================================================
 // 3. マイグレーション状態管理・スレッド制御 (Migration State & Control)
@@ -109,10 +109,10 @@ static void* qemu_monitor_thread(void *arg) {
 
     // x86のI/Oポート特権レベル（I/O Privilege Level）を最高（3）に引き上げ，inl/outlを許可する
     if (iopl(3) < 0) {
-        my_log("[MONITOR ERROR] iopl failed. Cannot monitor QEMU.\n");
+        my_log("[MONITOR-ERR] iopl failed. Cannot monitor QEMU.\n");
         return NULL;
     }
-    my_log("[MONITOR] QEMU Monitor Thread Started.\n");
+    my_log("[MONITOR-INFO] QEMU Monitor Thread Started.\n");
 
     // QEMUからのコマンドをポーリングして処理するループ
     while (true) {
@@ -120,36 +120,38 @@ static void* qemu_monitor_thread(void *arg) {
         uint32_t flag = inl(QEMU_PORT_MONGO_CMD);
         
         if (flag == 1 || flag == 2) {
-            my_log("[MONITOR] Phase %u Triggered!\n", flag);
+            my_log("[MONITOR-INFO] Phase %u Triggered!\n", flag);
             
-            // QEMU側へ指令を受け取ったことを通知 (コマンドポートを一度リセット)
+            // 2. QEMU側へ「指令を受信した(ACK)」ことを通知し、QEMU側のコマンドフラグをリセットさせる
             outl(0, QEMU_PORT_MONGO_CMD);
             
-            cpu_start = get_mongo_cpu_time(); // 計測開始
+            cpu_start = get_mongo_cpu_time();
 
-            // 2. 集約された各フェーズの実行
-            if (flag == 1) __wt_migration_set_skippages_bitmap(conn);
-            else __wt_migration_mark_clean_pages_dsk(conn);
+            // 3. 要求されたフェーズの同期実行
+            if (flag == 1) {
+                __wt_migration_set_skippages_bitmap(conn);
+            } else {
+                __wt_migration_mark_clean_pages_dsk(conn);
+            }
             
-            // 3. QEMUへの完了通知
-            outl(2, QEMU_PORT_MONGO_CMD);
-
-            cpu_end = get_mongo_cpu_time(); // 計測終了
+            cpu_end = get_mongo_cpu_time();
             
             // 4. 実行時間の記録とサマリーログの出力
             guest_cpu_time[flag - 1] = cpu_end - cpu_start;
-            my_log("[MONITOR] Phase %u Finished. cpu time: %lf sec\n", flag, guest_cpu_time[flag - 1]);
+            my_log("[MONITOR-INFO] Phase %u Finished. CPU time: %lf sec\n", flag, guest_cpu_time[flag - 1]);
             
             if (flag == 2) {
-                my_log("[MONITOR] Total cpu time: %lf sec\n", guest_cpu_time[0] + guest_cpu_time[1]);
+                my_log("[MONITOR-INFO] Total CPU time (Phase 1+2): %lf sec\n", guest_cpu_time[0] + guest_cpu_time[1]);
             }
 
-            // 5. QEMU側のセマフォ待機（qemu_sem_wait）を解除し，移送処理を再開
-            outl(1, QEMU_PORT_MONGO_DONE); 
-        } else if (flag == 3) { // 移送先での再開処理
-            my_log("[MONITOR] Resumed on Destination VM! Releasing barriers.\n");
+            // 5. QEMU側へ「処理完了(DONE)」を通知し、待機中のマイグレーションスレッドを起こす
+            outl(1, QEMU_PORT_MONGO_CMD); 
+
+        } else if (flag == 3) { 
+            // 移送先での再開処理
+            my_log("[MONITOR-INFO] Resumed on Destination VM! Releasing barriers.\n");
             
-            // コマンドポートをリセット (Ack)
+            // コマンドを受信したこと(ACK)を通知
             outl(0, QEMU_PORT_MONGO_CMD);
             
             // 6. 移送先で凍結していたMongoDBのグローバルロックおよびバリアを完全解除

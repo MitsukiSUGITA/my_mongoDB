@@ -10,6 +10,32 @@
 
 #include "wt_internal.h"
 
+
+// =========================================================================
+// スキップページ復元機構
+// =========================================================================
+/* 1. ディスク上のブロックメタデータ（最下層） */
+typedef struct __attribute__((packed)) {
+    uint64_t lba;       // ファイル内オフセットではなく、仮想ディスク上のLBA(セクタ番号)
+    uint32_t size;      // ディスク上の圧縮ブロックサイズ
+    uint64_t gpfn;      // [追加] ゲスト物理ページフレーム番号 (復元先メモリアドレス)
+} BlockMeta;
+
+/* 2. ファイルごとのメタデータグループ（中間層） */
+typedef struct {
+    char f_name[128];       // 復元する対象のファイル名
+    uint32_t block_num;     // このファイルから復元するブロック数
+    uint32_t block_capacity;// 動的拡張のためのキャパシティ
+    BlockMeta *blocks;      // 復元するブロックのメタデータ配列へのポインタ
+} FileGroupMeta;
+
+/* 3. 全体を管理するルート構造体（最上位） */
+typedef struct {
+    uint32_t file_num;      // 対象となるファイルの総数
+    uint32_t file_capacity; // 動的拡張のためのキャパシティ
+    FileGroupMeta *files;   // 各ファイルグループの配列へのポインタ
+} GlobalRestoreMeta;
+
 /*
  * =========================================================================
  * QEMU Migration Extensions (Live Migration Optimization)
@@ -43,7 +69,7 @@ extern void mongo_acquire_global_migration_lock(void) __attribute__((weak));
 extern void mongo_release_global_migration_lock(void) __attribute__((weak));
 
 /* プレコピーフェーズにてB-Treeを走査し、クリーンなページの転送スキップフラグを立てる関数 */
-int __wt_migration_set_skippages_bitmap(WT_CONNECTION *connection);
+int __wt_migration_set_skippages_bitmap(WT_CONNECTION *connection, GlobalRestoreMeta *meta);
 
 /* ストップ＆コピーフェーズにて、ダーティ状態を再評価し最終的なスキップ処理を行う関数 */
 int __wt_migration_mark_clean_pages_dsk(WT_CONNECTION *connection);

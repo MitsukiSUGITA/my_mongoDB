@@ -99,7 +99,7 @@ killall -9 mongod 2>/dev/null || true
 sleep 2
 
 # ★前回分のデータを消去 (純粋な状態から作成)
-rm -rf "$DB_PATH"
+rm -rf "$DB_PATH"/*
 mkdir -p "$DB_PATH"
 
 rm -f "$DB_PATH/my_debug.log"

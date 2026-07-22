@@ -14,26 +14,18 @@
 // =========================================================================
 // スキップページ復元機構
 // =========================================================================
-/* 1. ディスク上のブロックメタデータ（最下層） */
+/* 1. LBAマッピングの1エントリ（QEMUと完全に一致させる） */
 typedef struct __attribute__((packed)) {
-    uint64_t lba;       // ファイル内オフセットではなく、仮想ディスク上のLBA(セクタ番号)
-    uint32_t size;      // ディスク上の圧縮ブロックサイズ
-    uint64_t gpfn;      // [追加] ゲスト物理ページフレーム番号 (復元先メモリアドレス)
-} BlockMeta;
+    uint64_t gpfn;      // ゲスト物理ページフレーム番号 (復元先メモリアドレス)
+    uint64_t lba;       // 仮想ディスク上のLBA(セクタ番号)
+    uint32_t size;      // ディスク上のブロックサイズ
+} LbaMapEntry;
 
-/* 2. ファイルごとのメタデータグループ（中間層） */
+/* 2. 全体を管理するルート構造体（1次元配列） */
 typedef struct {
-    char f_name[128];       // 復元する対象のファイル名
-    uint32_t block_num;     // このファイルから復元するブロック数
-    uint32_t block_capacity;// 動的拡張のためのキャパシティ
-    BlockMeta *blocks;      // 復元するブロックのメタデータ配列へのポインタ
-} FileGroupMeta;
-
-/* 3. 全体を管理するルート構造体（最上位） */
-typedef struct {
-    uint32_t file_num;      // 対象となるファイルの総数
-    uint32_t file_capacity; // 動的拡張のためのキャパシティ
-    FileGroupMeta *files;   // 各ファイルグループの配列へのポインタ
+    uint32_t entry_num;      // 登録されたエントリの総数
+    uint32_t entry_capacity; // 動的拡張のためのキャパシティ
+    LbaMapEntry *entries;    // マッピング配列へのポインタ
 } GlobalRestoreMeta;
 
 /*

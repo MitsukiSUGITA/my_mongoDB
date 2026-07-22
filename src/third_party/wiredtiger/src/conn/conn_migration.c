@@ -112,54 +112,26 @@ static double get_mongo_cpu_time(void) {
  * 引数 size: 呼び出し元で事前計算された総バイト数
  */
 uint8_t* serialize_metadata(GlobalRestoreMeta* meta, size_t *size) {
-    uint8_t *buf, *ptr;
-    size_t total_size = 0;
-
-    // 引数チェック
     if (meta == NULL) return NULL;
 
-    // 1. 必要なサイズの計算
-    // ルート: file_num (4バイト)
-    total_size += sizeof(uint32_t);
-    for (int i = 0; i < meta->file_num; i++) {
-        // 各ファイル: f_name (128バイト) + block_num (4バイト)
-        total_size += 128 + sizeof(uint32_t);
-        // 各ファイルのブロック配列: offset(8B) + size(4B) の個数分
-        total_size += meta->files[i].block_num * sizeof(BlockMeta);
-    }
+    // 1. サイズの計算: エントリ数(4B) + (エントリのサイズ × 個数)
+    size_t entries_bytes = meta->entry_num * sizeof(LbaMapEntry);
+    size_t total_size = sizeof(uint32_t) + entries_bytes;
 
-    // 2. 必要なメモリ確保
-    buf = (uint8_t *)malloc(total_size);
+    uint8_t *buf = (uint8_t *)malloc(total_size);
     if (buf == NULL) return NULL;
-    ptr = buf; // 書き込み用ポインタを先頭にセット
 
-    // 3. 収集したメタデータのシリアライズ化    
-    // 3-1. GlobalRestoreMeta (file_num のみ．capacityはQEMUに不要なので省く)
-    memcpy(ptr, &meta->file_num, sizeof(uint32_t));
+    // 2. メモリへの書き込み
+    uint8_t *ptr = buf;
+    memcpy(ptr, &meta->entry_num, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
 
-    // 3-2. FileGroupMeta のシリアライズ
-    for (int i = 0; i < meta->file_num; i++) {
-        FileGroupMeta *file = &meta->files[i];
-
-        // ファイル名
-        memcpy(ptr, file->f_name, 128);
-        ptr += 128;
-        // ブロック数
-        memcpy(ptr, &file->block_num, sizeof(uint32_t));
-        ptr += sizeof(uint32_t);
-
-        // 2-3. BlockMeta のシリアライズ
-        // BlockMetaは内部にポインタを含まない「純粋な数値の塊」であるため，
-        // 配列全体を1発のmemcpyでコピーできる
-        size_t blocks_bytes = file->block_num * sizeof(BlockMeta);
-        if (blocks_bytes > 0) {
-            memcpy(ptr, file->blocks, blocks_bytes);
-            ptr += blocks_bytes;
-        }
+    if (entries_bytes > 0) {
+        memcpy(ptr, meta->entries, entries_bytes);
     }
+
     *size = total_size;
-    return buf;
+    return buf; // ※呼び出し元でfreeすること
 }
 
 /*
@@ -195,10 +167,13 @@ int write_all_metadata(int fd, const uint8_t *buf, size_t size) {
  * 抽出・シリアライズしたメタデータをQEMU(Virtio-Serial)へ送信する
  */
 static void send_meta_to_qemu(GlobalRestoreMeta* meta) {
-    size_t *payload_size;
+    size_t payload_size = 0;
 
     // 1. メタデータのシリアライズ化
-    uint8_t *payload = serialize_metadata(meta, payload_size);
+    uint8_t *payload = serialize_metadata(meta, &payload_size);
+
+    my_log("[MIG] metadata size: %zu\n", payload_size);
+    my_log("[MIG] entry size: %zu\n", meta->entry_num);
 
     if (payload != NULL) {
         // 2. QEMUへのパイプを開く
@@ -208,9 +183,11 @@ static void send_meta_to_qemu(GlobalRestoreMeta* meta) {
             uint64_t total_bytes = (uint64_t)payload_size;
             write_all_metadata(fd, (uint8_t*)&total_bytes, sizeof(uint64_t));
             // 4. 抽出したメタデータ本体を送信
-            write_all_metadata(fd, payload, *payload_size);
+            write_all_metadata(fd, payload, payload_size);
             
             close(fd);
+        } else {
+            my_log("[MIG-ERR] Failed to open virtio-port for metadata!\n");
         }
         // 5. 使い終わったバッファを解放
         free(payload);
@@ -566,7 +543,7 @@ static uint64_t get_lba_from_file_offset(const char *db_path, const char *filepa
 
     snprintf(real_filepath, sizeof(real_filepath), "%s/%s", db_path, clean_name);
 
-    if (dbg_cnt++ < 100) my_log("Opening real file: %s\n", real_filepath);
+    //if (dbg_cnt++ < 100) my_log("Opening real file: %s\n", real_filepath);
 
     // 4. 変換した正しいフルパスで open する
     int fd = open(real_filepath, O_RDONLY);
@@ -611,7 +588,7 @@ static uint64_t get_lba_from_file_offset(const char *db_path, const char *filepa
 }
 
 /*
- * add_page_meta --
+ * add_block_meta --
  * WT_REF（ディスク上の1ブロック）から物理アドレスを抽出し、メタデータに追加する関数
  * 引数:
  * session: WTの内部状態（ブロックマネージャ等）にアクセスするためのセッション情報
@@ -619,21 +596,16 @@ static uint64_t get_lba_from_file_offset(const char *db_path, const char *filepa
  * ref:     物理アドレス(クッキー)を抽出する対象となる、ディスク上の1ブロックを指すポインタ
  */
 uint64_t cnt = 0;
-void add_block_meta(WT_SESSION_IMPL *session, FileGroupMeta *file, const char *db_path, WT_REF *ref) {
-    if(file == NULL || ref == NULL || ref->page == NULL) return;
+void add_block_meta(WT_SESSION_IMPL *session, GlobalRestoreMeta *meta, const char *db_path, const char *filepath, WT_REF *ref) {
+    if(meta == NULL || ref == NULL || ref->page == NULL) return;
 
-    WT_BM *bm;           // ブロックマネージャ (物理I/Oの管理役)
-    WT_BTREE *btree;     // 現在のB-Treeツリー情報
-    WT_BLOCK *block;     // ファイルハンドルやブロックアロケーション情報
+    WT_BM *bm = S2BT(session)->bm;           // ブロックマネージャ (物理I/Oの管理役)
+    WT_BLOCK *block = bm->block;     // ファイルハンドルやブロックアロケーション情報
     wt_off_t offset;     // 【出力】OSが理解できるファイルの物理オフセット
     uint32_t checksum, objectid, size; // 【出力】チェックサム、ファイルID、読み込みサイズ
     WT_ADDR_COPY addr;   // WiredTiger内部の「暗号化されたクッキー」の一時保存先
     bool copy_success = false;
     int ret;
-
-    btree = S2BT(session);
-    bm = btree->bm;
-    block = bm->block;
 
     // 0. ページが勝手に分割・破棄されないように保護を開始する
     __wt_session_gen_enter(session, WT_GEN_SPLIT);
@@ -644,38 +616,28 @@ void add_block_meta(WT_SESSION_IMPL *session, FileGroupMeta *file, const char *d
     // 2. 用が済んだら速やかに保護を解除する
     __wt_session_gen_leave(session, WT_GEN_SPLIT);
 
-    if (!copy_success) {
-        return; // メモリ上にのみ存在、または削除済みの場合はスキップ
-    } else {
-        if(dbg_cnt++ < 100) my_log("Address copy success! size: %u\n", addr.size);
-        // 2. クッキーをOSが理解できる offset と size に解読
-        ret = __wt_block_addr_unpack(
-            session, block, addr.addr, addr.size, &objectid, &offset, &size, &checksum);
-        if (ret != 0) {
-            return; // 解読に失敗した場合は安全のために終了
-        }
-    }
+    if (!copy_success) return; // メモリ上にのみ存在、または削除済みの場合はスキップ
+
+    // 2. クッキーをOSが理解できる offset と size に解読
+    ret = __wt_block_addr_unpack(
+        session, block, addr.addr, addr.size, &objectid, &offset, &size, &checksum);
+    if (ret != 0) return; // 解読に失敗した場合は安全のために終了
 
     WT_PAGE *page = ref->page;
-    
     // ページがメモリ上に展開されており、PFNが計算済みかチェック
     if (page->mig_pfn_cnt == 0) return;
 
-    if(dbg_cnt++ < 100) my_log("start get_lba_from_file_offset\n");
     // 3. ファイルオフセットからLBA(セクタ)への変換
     // ※ file->f_name には既に対象のファイルパスが格納されている前提
-    uint64_t lba = get_lba_from_file_offset(db_path, file->f_name, (uint64_t)offset, size);
+    uint64_t lba = get_lba_from_file_offset(db_path, filepath, (uint64_t)offset, size);
     if (lba == 0) {
-        if(dbg_cnt++ < 100) my_log("failed get_lba_from_file_offset\n");
         return; // 変換失敗時は安全のため登録をスキップし，通常転送にフォールバック
     }
 
     // ===== Debug ====================================================================
-    if(dbg_cnt++ < 100) my_log("start Debug\n");
     
-    // ゲストOSのルートブロックデバイス（またはLVMボリューム）/dev/mapper/ubuntu--vg-ubuntu--lv
-    //const char *device_path = "/dev/vda"; 
-    const char *device_path = "/dev/mapper/ubuntu--vg-ubuntu--lv"; 
+    // 追加した独立ディスク（/dev/vdb）を直接指定
+    const char *device_path = "/dev/vdb"; 
     int raw_fd = open(device_path, O_RDONLY | O_DIRECT);
     
     if (raw_fd >= 0) {
@@ -688,6 +650,13 @@ void add_block_meta(WT_SESSION_IMPL *session, FileGroupMeta *file, const char *d
 
                 if (memcmp(mem_ptr, verify_buf, 4096) == 0) {
                     if(dbg_cnt++ < 100) my_log("[DEBUG] LBA Match OK! LBA: %llu\n", lba);
+                    static int match_cnt = 0;
+                    if (match_cnt < 10) {
+                        my_log("----------- Hex Dump ---------------\n");
+                        for(int i = 0; i < 32; i++) my_log("%02x ", ((unsigned char*)mem_ptr)[i]);                        
+                        my_log("\n---------------------------------\n");
+                        match_cnt++;
+                    }
                 } else {
                     if(dbg_cnt++ < 100) my_log("[DEBUG-ERR] LBA Mismatch! LBA: %llu\n", lba);
                     
@@ -718,69 +687,19 @@ void add_block_meta(WT_SESSION_IMPL *session, FileGroupMeta *file, const char *d
     // ================================================================================
 
     // 4. 配列の拡張チェック
-    if (file->block_num >= file->block_capacity) {
-        uint32_t new_cap = (file->block_capacity == 0) ? 128 : file->block_capacity * 2;
-        BlockMeta *new_blocks = realloc(file->blocks, new_cap * sizeof(BlockMeta));
-        if (new_blocks == NULL) return; // メモリ枯渇時
-        file->blocks = new_blocks;
-        file->block_capacity = new_cap;
+    if (meta->entry_num >= meta->entry_capacity) {
+        uint32_t new_cap = (meta->entry_capacity == 0) ? 128 : meta->entry_capacity * 2;
+        LbaMapEntry *new_entries = realloc(meta->entries, new_cap * sizeof(LbaMapEntry));
+        if (new_entries == NULL) return; // メモリ枯渇時
+        meta->entries = new_entries;
+        meta->entry_capacity = new_cap;
     }
 
     // 5. 配列への登録
-    file->blocks[file->block_num].lba = lba;
-    file->blocks[file->block_num].size = size;
-    file->blocks[file->block_num].gpfn = page->mig_pfns[0]; 
-    file->block_num++;
-}
-
-/*
- * get_restore_metadata --
- * 抽出したページメタデータを適切なファイルグループに振り分け、全体を管理する関数
- * session: WTの内部状態（ブロックマネージャ等）にアクセスするためのセッション情報。
- * file:    抽出したブロックメタデータ(offset, size)を追加・格納するファイルグループ構造体。
- * ref:     物理アドレス(クッキー)を抽出する対象となる、ディスク上の1ブロックを指すポインタ。
- */
-void get_restore_metadata(WT_SESSION_IMPL *session, GlobalRestoreMeta *meta, const char *db_path, const char *name, WT_REF *ref) {
-    if(meta == NULL || name == NULL || ref == NULL) return;
-
-    uint32_t file_id = -1;
-
-
-    // 1. 復元を行うページが含まれるファイルが既にあるか探索
-    for(int i = 0; i < meta->file_num; i++) {
-        if(strcmp(name, meta->files[i].f_name) == 0) {
-            file_id = i;
-            break;
-        }
-    }
-
-    // 2. ファイルが存在しない場合(新規ファイル)の追加処理
-    if(file_id == -1) {
-        if(meta->file_num >= meta->file_capacity) {
-            uint32_t new_cap = (meta->file_capacity == 0) ? 4 : meta->file_capacity * 2;
-            FileGroupMeta *new_files = realloc(meta->files, new_cap * sizeof(FileGroupMeta));
-        
-            if (new_files == NULL) { // メモリ枯渇時のフェイルセーフ
-                return;
-            }
-            meta->files = new_files;
-            meta->file_capacity = new_cap;
-        }
-        file_id = meta->file_num;
-        strcpy(meta->files[file_id].f_name, name);
-        
-        // 新規構造体の初期化
-        meta->files[file_id].block_num = 0;
-        meta->files[file_id].block_capacity = 0;
-        meta->files[file_id].blocks = NULL;
-        
-        meta->file_num++;
-        }
-
-    // 3. 各ページを復元するためのメタデータ収集処理へ委譲
-    if(dbg_cnt++ < 100) my_log("start add_block_meta\n");
-    add_block_meta(session, &meta->files[file_id], db_path, ref);
-
+    meta->entries[meta->entry_num].lba = lba;
+    meta->entries[meta->entry_num].size = size;
+    meta->entries[meta->entry_num].gpfn = page->mig_pfns[0]; 
+    meta->entry_num++;
 }
 
 /*
@@ -882,8 +801,7 @@ int __wt_migration_set_skippages_bitmap(WT_CONNECTION *connection, GlobalRestore
                     populate_page_pfn_array(ref->page);
                     // 4-5-2. スキップビットマップにアトミックに1をセット
                     update_migration_bitmap(connection, ref->page, 1);
-                    if(dbg_cnt++ < 100) my_log("start get_restore_metadata\n");
-                    get_restore_metadata(session_impl, meta, conn_impl->home, dhandle->name, ref);
+                    add_block_meta(session_impl, meta, conn_impl->home, dhandle->name, ref);
                     __sync_synchronize(); // メモリバリア：QEMU 側の移送スレッドに対してビットマップへの登録を即座に可視化
 
                     // 4-5-3. ダブルチェック：フラグを立てた直後にバックグラウンドで書き換えられていないか

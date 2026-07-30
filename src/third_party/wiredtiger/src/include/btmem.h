@@ -940,6 +940,7 @@ typedef uint8_t WT_REF_STATE;
 #define WT_REF_LOCKED 2  /* Page locked for exclusive access */
 #define WT_REF_MEM 3     /* Page is in cache and valid */
 #define WT_REF_SPLIT 4   /* Parent page split (WT_REF dead) */
+#define WT_REF_MIG 5
 
 /*
  * Prepare states.
@@ -1238,6 +1239,7 @@ struct __wt_ref {
 #define WT_REF_FLAG_PREFETCH 0x1u   /* Page is on the pre-fetch queue */
 #define WT_REF_FLAG_READING 0x2u    /* Page is being read in */
                                     /* AUTOMATIC FLAG VALUE GENERATION STOP 8 */
+#define WT_REF_FLAG_MIG_SKIP 0x80u
     wt_shared uint8_t flags_atomic; /* Atomic flags, use F_*_ATOMIC_8 */
 
     /*

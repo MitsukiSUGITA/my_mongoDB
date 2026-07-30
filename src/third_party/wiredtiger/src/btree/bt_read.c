@@ -434,6 +434,28 @@ read:
                 break;
             }
 
+            if (F_ISSET_ATOMIC_8(ref, WT_REF_FLAG_MIG_SKIP)) {
+                // 1. まずフラグを下ろす
+                F_CLR_ATOMIC_8(ref, WT_REF_FLAG_MIG_SKIP);
+
+                // 2. 取得したハザードポインタを一旦解除する（WT_RETマクロで囲む）
+                WT_RET(__wt_hazard_clear(session, ref));
+
+                // 3. 状態を WT_REF_DISK に戻す（これで __page_read が騙されてくれる）
+                // ※ 他のスレッドと競合しないようCASで安全に状態遷移させます
+                if (WT_REF_CAS_STATE(session, ref, WT_REF_MEM, WT_REF_DISK)) {
+                    // 4. ここで初めてポインタを安全に切り離す
+                    ref->page = NULL;
+                    
+                    // 5. 強制的にディスク読み込みパスへ飛ばす
+                    goto read;
+                } else {
+                    // 万が一CASに失敗した場合（他のスレッドが介入した等）は、
+                    // 今回のアクセスは諦めてリトライさせる（デッドロック回避）
+                    return (WT_RESTART);
+                }
+            }
+
             /*
              * If a page has grown too large, we'll try and forcibly evict it before making it
              * available to the caller. There are a variety of cases where that's not possible.

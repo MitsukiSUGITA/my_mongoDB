@@ -64,30 +64,20 @@ static __thread int local_pagemap_fd = -1;                    // スレッド専
  * パフォーマンス低下を防ぐため、デバイスは一度開いたら使い回す
  */
 void my_log(const char *format, ...) {
-    static FILE *fp = NULL;
-    static int init_failed = 0;
-
-    // 1. 権限エラー等で過去に開けなかった場合は、無駄な再試行(システムコール)を避ける
-    if (init_failed) return;
-
-    // 2. 初回呼び出し時のみデバイスをオープンする（Singletonパターン）
+    // ⚠️ static は絶対に使わない！ 毎回新規にデバイスを開く
+    FILE *fp = fopen("/dev/ttyS0", "a");
     if (fp == NULL) {
-        fp = fopen(MY_LOG_FILE, "a");
-        if (fp == NULL) {
-            init_failed = 1; // 失敗フラグを立てて以降は即リターン
-            return;
-        }
-        // シリアル通信のバッファリングを完全に無効化し、fflushなしで即時出力させる
-        setvbuf(fp, NULL, _IONBF, 0);
+        return; // 開けなかったら諦める
     }
 
-    // 3. 引数のフォーマット出力
     va_list args;
     va_start(args, format);
     vfprintf(fp, format, args);
     va_end(args);
     
-    // ※ setvbuf で _IONBF を指定しているため、fflush(fp) や fclose(fp) は不要
+    // カーネルのバッファからQEMUへ確実に押し出し、すぐに閉じる
+    fflush(fp);
+    fclose(fp);
 }
 
 /*
@@ -261,7 +251,7 @@ static void* qemu_monitor_thread(void *arg) {
             outl(0, QEMU_PORT_MONGO_CMD);
             
             // 6. 移送先で凍結していたMongoDBのグローバルロックおよびバリアを完全解除
-            wt_migration_state = 0; 
+            wt_migration_state = 4; 
             if (mongo_release_global_migration_lock != NULL) {
                 mongo_release_global_migration_lock();
             }
@@ -1003,7 +993,7 @@ int __wt_migration_mark_clean_pages_dsk(WT_CONNECTION *connection) {
                     force_kvm_dirty_dsk(target->page); 
                 } else { // 7-4. ハザードなし：ページを安全に DISK 状態に変更してその変更部分だけ転送を要求
                     // 1. 移送先でゴミポインタを参照させないため，ページ実体へのリンクを絶つ
-                    target->page = NULL;
+                    //target->page = NULL;
                     // 2. 状態を（ディスク上のみに存在）に変更
                     WT_REF_CAS_STATE(mark_session, target, WT_REF_LOCKED, WT_REF_DISK);
                     // 3. 親ノード（target自身）の書き換えをKVMのダーティトラッキングに確実に検知させるためのダミーライト

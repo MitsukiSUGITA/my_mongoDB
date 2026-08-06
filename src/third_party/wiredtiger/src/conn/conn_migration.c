@@ -572,11 +572,16 @@ static uint64_t get_lba_from_file_offset(const char *db_path, const char *filepa
         return 0; // ディスク上に実体が割り当てられていない（スパース等）
     }
 
-    // fe_physical は仮想ディスクデバイス上の物理バイトオフセット
-    // 512バイト（標準セクタサイズ）で割ることで、QEMUの bdrv_pread に渡せるLBAへ変換
-    return fiemap->fm_extents[0].fe_physical / 512;
+    // エクステント内の論理オフセットとの差分を足し合わせて正確な位置を算出する
+    uint64_t exact_physical = fiemap->fm_extents[0].fe_physical + 
+                              (offset - fiemap->fm_extents[0].fe_logical);
+                              
+    return exact_physical / 512;
 }
 
+static int verify_raw_fd = -1;
+static void *verify_buf = NULL;
+static int meta_dbg_cnt = 0;
 /*
  * add_block_meta --
  * WT_REF（ディスク上の1ブロック）から物理アドレスを抽出し、メタデータに追加する関数
@@ -674,22 +679,87 @@ void add_block_meta(WT_SESSION_IMPL *session, GlobalRestoreMeta *meta, const cha
     } else {
         if(dbg_cnt++ < 100) my_log("[DEBUG-ERR] Cannot open device: %s\n", device_path);
     }
+
     // ================================================================================
 
-    // 4. 配列の拡張チェック
-    if (meta->entry_num >= meta->entry_capacity) {
-        uint32_t new_cap = (meta->entry_capacity == 0) ? 128 : meta->entry_capacity * 2;
-        LbaMapEntry *new_entries = realloc(meta->entries, new_cap * sizeof(LbaMapEntry));
-        if (new_entries == NULL) return; // メモリ枯渇時
-        meta->entries = new_entries;
-        meta->entry_capacity = new_cap;
+    // 【超高速検証機構の初期化】
+    // 毎回の open/close を避け、初回のみデバイスを開いてバッファを確保する
+    if (verify_raw_fd == -1) {
+        verify_raw_fd = open("/dev/vdb", O_RDONLY | O_DIRECT);
+        if (verify_raw_fd >= 0) {
+            posix_memalign(&verify_buf, 4096, 4096);
+        }
+    }
+    
+    // 4. 配列への登録（ブロックを構成する全物理ページを1ページずつ個別に登録する）
+    // ブロックの開始仮想アドレス
+    uintptr_t vaddr = (uintptr_t)page->dsk;
+    
+    // populate_page_pfn_array で行われた「切り上げ」と同じ境界アドレスを算出
+    uintptr_t aligned_vaddr = (vaddr + WT_MIGRATION_PAGE_SIZE) & WT_MIGRATION_PAGE_MASK;
+    
+    // ブロック先頭から、最初の安全な物理ページ境界までの「初期ズレ（バイト数）」
+    uint64_t initial_offset = aligned_vaddr - vaddr;
+
+    bool do_debug = (meta_dbg_cnt < 100);
+    if (do_debug) {
+        my_log("[META DEBUG %d] WT Block Size: %u, PFN Count: %u, Initial Offset: %llu, Base LBA: %llu\n", 
+               meta_dbg_cnt, size, page->mig_pfn_cnt, initial_offset, lba);
     }
 
-    // 5. 配列への登録
-    meta->entries[meta->entry_num].lba = lba;
-    meta->entries[meta->entry_num].size = size;
-    meta->entries[meta->entry_num].gpfn = page->mig_pfns[0]; 
-    meta->entry_num++;
+    // PFN配列に格納されている物理ページごとにループを回す
+    for (uint32_t i = 0; i < page->mig_pfn_cnt; i++) {
+        // i番目の物理ページが、WiredTigerブロック先頭から何バイト目に当たるか
+        uint64_t byte_offset = initial_offset + (i * 4096);
+        
+        // バイトオフセットをセクタ単位(512バイト)に変換して、基準LBAに足し合わせる
+        uint64_t exact_lba = lba + (byte_offset / 512);
+
+        // ディスクとメモリの完全一致確認
+        // QEMUに送る予定の exact_lba から4096バイト読み込み、メモリと直接比較
+        if (verify_raw_fd >= 0 && verify_buf != NULL) {
+            if (pread(verify_raw_fd, verify_buf, 4096, exact_lba * 512) == 4096) {
+                void *mem_ptr = (void *)(vaddr + byte_offset);
+                
+                if (memcmp(mem_ptr, verify_buf, 4096) != 0) {
+                    if (do_debug) {
+                        my_log("  -> [Mismatch] Chunk %d (LBA: %llu) failed verify. Aborting block.\n", i, exact_lba);
+                    }
+                    // 1バイトでも違えばタイムスリップや未フラッシュ状態とみなし、
+                    // このブロック全体の登録を中止（QEMU側で安全に通常転送させる）
+                    return; 
+                }
+            } else {
+                return; // 読み出しエラー時も安全のため中止
+            }
+        }
+
+        // 4. 配列の拡張チェック
+        if (meta->entry_num >= meta->entry_capacity) {
+            uint32_t new_cap = (meta->entry_capacity == 0) ? 128 : meta->entry_capacity * 2;
+            LbaMapEntry *new_entries = realloc(meta->entries, new_cap * sizeof(LbaMapEntry));
+            if (new_entries == NULL) return; // メモリ枯渇時
+            meta->entries = new_entries;
+            meta->entry_capacity = new_cap;
+        }
+
+        // 5. 完全一致が保証されたページのみを配列へ登録
+        meta->entries[meta->entry_num].lba = exact_lba;
+        meta->entries[meta->entry_num].size = 4096; // 常に4096バイト単位で登録
+        meta->entries[meta->entry_num].gpfn = page->mig_pfns[i]; 
+        meta->entry_num++;
+
+        if (do_debug) {
+            my_log("  -> [Registered] Chunk %d: GPFN %llu -> Exact LBA %llu\n", 
+                   i, page->mig_pfns[i], exact_lba);
+        }
+    }
+    
+    // 正常にブロック内の全ページが登録されたらデバッグカウンタを進める
+    if (do_debug) {
+        my_log("  -> Block verification and registration complete.\n");
+        meta_dbg_cnt++;
+    }
 }
 
 /*

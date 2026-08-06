@@ -14,7 +14,6 @@ fi
 # 0. サイズ計算ロジック (4G などを バイト数とドキュメント数に変換)
 # ==========================================
 PADDING_SIZE=10240 
-INPUT_DOC_COUNT=10000
 
 MEM_UNIT=$(echo "$TARGET_MEM" | grep -o -E '[A-Za-z]+' | tr '[:lower:]' '[:upper:]')
 MEM_NUM=$(echo "$TARGET_MEM" | grep -o -E '[0-9]+')
@@ -148,43 +147,23 @@ mongosh --quiet --port "$PORT" --eval "
   db.my_table.drop();
   let bulk = db.my_table.initializeUnorderedBulkOp();
   
-  const docCount = $INPUT_DOC_COUNT;
-  const docSize = $PADDING_SIZE;
+  const padding = 'A'.repeat($PADDING_SIZE); 
+  const totalDocs = $INPUT_DOC_COUNT;
 
   print('Executing bulk insert in batches...');
-  for (let i = 0; i < docCount; i++) {
-      // インデックス番号を7桁のゼロ埋めにする (例: '0000123')
-      const idStr = String(i).padStart(7, '0');
-      
-      let padding = '';
-      let currentOffset = 0;
-      
-      // パディング全体を [ID-OFFSET] の形式で埋め尽くす
-      while (padding.length < docSize) {
-          // ドキュメント先頭からのオフセットを5桁のゼロ埋めで表現
-          const offStr = String(currentOffset).padStart(5, '0');
-          
-          // 例: '[0000123-00000]' (固定15文字)
-          const chunk = '[' + idStr + '-' + offStr + ']';
-          padding += chunk;
-          currentOffset += chunk.length;
-      }
-      
-      // ぴったり指定サイズ(10240)に切り詰める
-      padding = padding.substring(0, docSize);
-
+  for (let i = 0; i < totalDocs; i++) {
       bulk.insert({ _id: i, val: padding });
       
-      if ((i + 1) % 1000 === 0) {
+      if ((i + 1) % 10000 === 0) {
           bulk.execute();
-          print('  Inserted ' + (i + 1) + ' / ' + docCount + ' documents...');
+          print('  Inserted ' + (i + 1) + ' / ' + totalDocs + ' documents...');
           bulk = db.my_table.initializeUnorderedBulkOp();
       }
   }
-  if (docCount % 1000 !== 0) {
+  if (totalDocs % 10000 !== 0) {
       bulk.execute();
   }
-  print('✅ Insert complete');
+  print('✅ Insert complete: ' + totalDocs + ' documents.');
 "
 
 check_cache_stats "データ挿入直後 (Dirty Rateが高い状態)"

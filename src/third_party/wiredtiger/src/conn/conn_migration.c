@@ -581,7 +581,6 @@ static uint64_t get_lba_from_file_offset(const char *db_path, const char *filepa
 
 static int verify_raw_fd = -1;
 static void *verify_buf = NULL;
-static int meta_dbg_cnt = 0;
 /*
  * add_block_meta --
  * WT_REF（ディスク上の1ブロック）から物理アドレスを抽出し、メタデータに追加する関数
@@ -590,7 +589,6 @@ static int meta_dbg_cnt = 0;
  * file:    抽出したブロックメタデータ(offset, size)を追加・格納するファイルグループ構造体
  * ref:     物理アドレス(クッキー)を抽出する対象となる、ディスク上の1ブロックを指すポインタ
  */
-uint64_t cnt = 0;
 void add_block_meta(WT_SESSION_IMPL *session, GlobalRestoreMeta *meta, const char *db_path, const char *filepath, WT_REF *ref) {
     if(meta == NULL || ref == NULL || ref->page == NULL) return;
 
@@ -629,58 +627,6 @@ void add_block_meta(WT_SESSION_IMPL *session, GlobalRestoreMeta *meta, const cha
         return; // 変換失敗時は安全のため登録をスキップし，通常転送にフォールバック
     }
 
-    // ===== Debug ====================================================================
-    
-    // 追加した独立ディスク（/dev/vdb）を直接指定
-    const char *device_path = "/dev/vdb"; 
-    int raw_fd = open(device_path, O_RDONLY | O_DIRECT);
-    
-    if (raw_fd >= 0) {
-        void *verify_buf;
-        if (posix_memalign(&verify_buf, 4096, 4096) == 0) {
-            
-            if (pread(raw_fd, verify_buf, 4096, lba * 512) == 4096) {
-                
-                void *mem_ptr = (void *)((uintptr_t)page->dsk); 
-
-                if (memcmp(mem_ptr, verify_buf, 4096) == 0) {
-                    if(dbg_cnt++ < 100) my_log("[DEBUG] LBA Match OK! LBA: %llu\n", lba);
-                    static int match_cnt = 0;
-                    if (match_cnt < 10) {
-                        my_log("----------- Hex Dump ---------------\n");
-                        for(int i = 0; i < 32; i++) my_log("%02x ", ((unsigned char*)mem_ptr)[i]);                        
-                        my_log("\n---------------------------------\n");
-                        match_cnt++;
-                    }
-                } else {
-                    if(dbg_cnt++ < 100) my_log("[DEBUG-ERR] LBA Mismatch! LBA: %llu\n", lba);
-                    
-                    // ★追加: 最初の3回だけHexダンプして比較する
-                    static int dump_cnt = 0;
-                    if (dump_cnt < 3) {
-                        my_log("----------- Hex Dump ---------------\n");
-                        
-                        for(int i = 0; i < 4096; i++) {
-                            if(((unsigned char*)mem_ptr)[i] != ((unsigned char*)verify_buf)[i])
-                                my_log("[%d]MEM: %02xDSK: %02x\t", i, ((unsigned char*)mem_ptr)[i], ((unsigned char*)verify_buf)[i]);
-                        }
-                        
-                        my_log("\n---------------------------------\n");
-                        
-                        dump_cnt++;
-                    }
-                }
-            } else {
-                if(dbg_cnt++ < 100) my_log("[DEBUG-ERR] pread failed for LBA: %llu\n", lba);
-            }
-            free(verify_buf);
-        }
-        close(raw_fd);
-    } else {
-        if(dbg_cnt++ < 100) my_log("[DEBUG-ERR] Cannot open device: %s\n", device_path);
-    }
-
-    // ================================================================================
 
     // 【超高速検証機構の初期化】
     // 毎回の open/close を避け、初回のみデバイスを開いてバッファを確保する
@@ -701,11 +647,6 @@ void add_block_meta(WT_SESSION_IMPL *session, GlobalRestoreMeta *meta, const cha
     // ブロック先頭から、最初の安全な物理ページ境界までの「初期ズレ（バイト数）」
     uint64_t initial_offset = aligned_vaddr - vaddr;
 
-    bool do_debug = (meta_dbg_cnt < 100);
-    if (do_debug) {
-        my_log("[META DEBUG %d] WT Block Size: %u, PFN Count: %u, Initial Offset: %llu, Base LBA: %llu\n", 
-               meta_dbg_cnt, size, page->mig_pfn_cnt, initial_offset, lba);
-    }
 
     // PFN配列に格納されている物理ページごとにループを回す
     for (uint32_t i = 0; i < page->mig_pfn_cnt; i++) {
@@ -722,9 +663,6 @@ void add_block_meta(WT_SESSION_IMPL *session, GlobalRestoreMeta *meta, const cha
                 void *mem_ptr = (void *)(vaddr + byte_offset);
                 
                 if (memcmp(mem_ptr, verify_buf, 4096) != 0) {
-                    if (do_debug) {
-                        my_log("  -> [Mismatch] Chunk %d (LBA: %llu) failed verify. Aborting block.\n", i, exact_lba);
-                    }
                     // 1バイトでも違えばタイムスリップや未フラッシュ状態とみなし、
                     // このブロック全体の登録を中止（QEMU側で安全に通常転送させる）
                     return; 
@@ -748,17 +686,6 @@ void add_block_meta(WT_SESSION_IMPL *session, GlobalRestoreMeta *meta, const cha
         meta->entries[meta->entry_num].size = 4096; // 常に4096バイト単位で登録
         meta->entries[meta->entry_num].gpfn = page->mig_pfns[i]; 
         meta->entry_num++;
-
-        if (do_debug) {
-            my_log("  -> [Registered] Chunk %d: GPFN %llu -> Exact LBA %llu\n", 
-                   i, page->mig_pfns[i], exact_lba);
-        }
-    }
-    
-    // 正常にブロック内の全ページが登録されたらデバッグカウンタを進める
-    if (do_debug) {
-        my_log("  -> Block verification and registration complete.\n");
-        meta_dbg_cnt++;
     }
 }
 
